@@ -15,6 +15,7 @@ IGNORE_FILES = [
     "README.md",
     "build/*",
     "manifest_*",
+    "manifest.json",
     "build.py",
     ".DS_Store"
 ]
@@ -25,7 +26,7 @@ def ignore_file(file: Path):
     for ignore in IGNORE_FILES:
         if fnmatch.fnmatch(str(file), ignore):
             return True
-    
+
 
 os.makedirs("build", exist_ok=True)
 with ZipFile(f"build/sc-filter-{version}-mv2.zip", "w") as zip:
@@ -40,4 +41,3 @@ with ZipFile(f"build/sc-filter-{version}-mv3.zip", "w") as zip:
         zip.write(file)
     with open("manifest_v3.json") as f:
         zip.writestr("manifest.json", f.read())
-    

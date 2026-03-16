@@ -1,14 +1,14 @@
 {
     "manifest_version": 2,
-    "name": "SoundCloud Feed Filter",
-    "description": "Adds multiple filtering options to your SoundCloud feed",
+    "name": "SoundCloud Feed Filter Extended",
+    "description": "Filter your SoundCloud feed — block reposts, filter by track length, content age, tags, free downloads, and more.",
     "icons": {
         "16": "icons/icon16.png",
         "32": "icons/icon32.png",
         "48": "icons/icon48.png",
         "128": "icons/icon128.png"
     },
-    "version": "1.0.7",
+    "version": "1.0.0",
     "content_scripts": [
         {
             "matches": ["*://*.soundcloud.com/*"],
@@ -17,8 +17,7 @@
         }
     ],
     "web_accessible_resources": [
-        "/src/filter.js",
-        "/src/filters/*.js"
+        "/src/filter.js"
     ],
     "permissions": [
         "storage",
@@ -26,7 +25,10 @@
     ],
     "browser_specific_settings": {
         "gecko": {
-            "id": "sc-filter@7x11x13.xyz"
+            "id": "tk.feed@pm.me",
+            "data_collection_permissions": {
+                "required": ["none"]
+            }
         }
     }
 }
