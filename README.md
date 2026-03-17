@@ -46,3 +46,7 @@ The extension ships with these pre-configured tabs:
 3. Click Save — the tab appears in the bar as the last item
 4. Switch between tabs to instantly change your feed view
 
+## Installation
+
+![Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
+
