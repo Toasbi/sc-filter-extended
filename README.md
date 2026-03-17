@@ -48,5 +48,5 @@ The extension ships with these pre-configured tabs:
 
 ## Installation
 
-![Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
+[Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
 
