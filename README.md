@@ -8,6 +8,13 @@ Disclaimer: This is mostly vibe coded, dont expect perfect code :)
 ![Example2](/docs/screenshotdark.png)
 
 
+## Installation
+
+[Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
+
+[Firefox](https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-extended/)
+
+
 ## Credits
 
 This extension is based/inspired on these extensions:
@@ -46,7 +53,5 @@ The extension ships with these pre-configured tabs:
 3. Click Save — the tab appears in the bar as the last item
 4. Switch between tabs to instantly change your feed view
 
-## Installation
 
-[Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
 
