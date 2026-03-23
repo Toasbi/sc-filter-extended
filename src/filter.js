@@ -380,6 +380,7 @@ async function getFollowingIdsAndUsernames() {
 }
 
 function shouldStopLoadingFeed(settings, responseCollection) {
+    if (!config.settings) return url;
     const maxContentAgeInDays = settings.contentAgeInDays?.max;
     const isContentAgeLimitEnabled = settings.contentAgeInDays?.enabled;
 
