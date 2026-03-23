@@ -57,6 +57,7 @@ function getItemTags(obj) {
 }
 
 function applyActivityTypeFilter(url, config) {
+    if (!config.settings) return url;
     const hideAllPlaylists = config.settings.playlistFilter.enabled &&
         config.settings.playlistFilter.mode === "hideAll";
     const hideAllReposts = config.settings.filterReposts.enabled &&
@@ -380,7 +381,6 @@ async function getFollowingIdsAndUsernames() {
 }
 
 function shouldStopLoadingFeed(settings, responseCollection) {
-    if (!config.settings) return url;
     const maxContentAgeInDays = settings.contentAgeInDays?.max;
     const isContentAgeLimitEnabled = settings.contentAgeInDays?.enabled;
 
