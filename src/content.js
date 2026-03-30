@@ -125,7 +125,7 @@ function buildDefaultTabs() {
             type: "settings",
             settings: sanitizeSettings({
                 filterReposts: {enabled: true, type: "allowRepostedTracksOfFollowers"},
-                trackLengthInMin: {enabled: true, min: 0, max: 30},
+                trackLengthInMin: {enabled: true, min: 0, max: 20},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true}
             }),
         },
@@ -134,7 +134,7 @@ function buildDefaultTabs() {
             name: "Only mixes by followed",
             type: "settings",
             settings: sanitizeSettings({
-                filterReposts: {enabled: true, type: "allowRepostedTracksOfFollowers"},
+                filterReposts: {enabled: true, type: "allowNone"},
                 trackLengthInMin: {enabled: true, min: 45, max: 120},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true},
             }),
@@ -155,7 +155,7 @@ function buildDefaultTabs() {
             type: "settings",
             settings: sanitizeSettings({
                 freeDownloadsOnly: {enabled: true},
-                trackLengthInMin: {enabled: true, min: 0, max: 30},
+                trackLengthInMin: {enabled: true, min: 0, max: 20},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true}
             }),
         },
@@ -165,7 +165,7 @@ function buildDefaultTabs() {
             type: "settings",
             settings: sanitizeSettings({
                 freeDownloadsOnly: {enabled: true},
-                trackLengthInMin: {enabled: true, min: 0, max: 30},
+                trackLengthInMin: {enabled: true, min: 0, max: 20},
                 contentAgeInDays: {enabled: true, min: null, max: 7},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true}
             }),
