@@ -14,6 +14,11 @@ function isFreeDownload(track) {
         "drive.google.com",
         "sharepoint.com",
         "dropbox.com",
+        "gaterush.me",
+        "vlrz.me",
+        "valorizd.app",
+        "fangate.eu",
+        "premierely.io"
     ];
     const containsFreeDomain = (s) => freeDomains.some((d) => s.includes(d));
     const purchaseUrl = track.purchase_url;
@@ -120,6 +125,13 @@ function shouldFilterTrack(track, settings, seenIds, debug) {
 // Returns true if the playlist should be removed.
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
 function shouldFilterPlaylist(playlist, settings, seenIds, debug) {
+    // hideAll is enforced server-side via the activityTypes rewrite, but
+    // playlist reposts can still arrive (the rewrite only strips PlaylistPost)
+    // — remove any playlist that reaches here.
+    if (settings.playlistFilter.enabled && settings.playlistFilter.mode === "hideAll") {
+        if (debug) debug.checks.push("playlistFilter ✗ hideAll");
+        return true;
+    }
     const tracks = playlist.tracks;
     if (!tracks || tracks.length === 0) return false;
     if (settings.contentAgeInDays.enabled && settings.contentAgeInDays.max !== null) {
@@ -213,7 +225,13 @@ function shouldFilterItem(item, settings, followingData, seenIds, debug) {
         const content = item.track ?? item.playlist;
         const userId = content?.user_id;
 
-        // allowNone: reposts are excluded server-side via activityTypes — no items reach here.
+        // allowNone: track reposts are excluded server-side via activityTypes,
+        // but playlist reposts can still arrive (the rewrite only strips
+        // TrackRepost) — remove any repost that reaches here.
+        if (settings.filterReposts.type === "allowNone") {
+            if (debug) debug.checks.push("filterReposts ✗ allowNone");
+            return true;
+        }
 
         if (settings.filterReposts.type === "allowRepostedTracksOfFollowers") {
             if (item.type === "track-repost") {
@@ -360,7 +378,7 @@ async function getFollowingUsers() {
             let resp = await fetchAuthorized(url, authToken);
             followings = followings.concat(resp.collection);
             url = resp.next_href;
-        } while (url !== null);
+        } while (url); // next_href may be null or absent on the last page
 
         console.log(`Fetched ${followings.length} followings for current user`);
         return followings;
@@ -397,12 +415,183 @@ function shouldStopLoadingFeed(settings, responseCollection) {
     return lastContent && daysSince(lastContent.created_at) > maxContentAgeInDays;
 }
 
+// ── Impure: SoundCloud internals bridge ──────────────────────────────────────
+// Everything in this section touches undocumented SoundCloud internals and is
+// expected to break eventually. All internals access is quarantined here; the
+// only entry point is softResetFeed(), and every failure mode is a thrown
+// Error (or rejected promise) that the caller turns into a full page reload
+// (the pre-soft-reset behavior). Discovery is by shape and stable string
+// names, never by webpack module ID: IDs are sequential integers that change
+// on every SoundCloud deploy, but method/property names (currentLayout,
+// getSourceInfo, empty, fetch, ...) survive minification. Verified 2026-07-04
+// against app_version 1782999645.
+//
+// The reset mechanism refreshes the live stream collection IN PLACE:
+// collection.empty() clears its models + pagination (next_href/offset), then
+// collection.fetch({reset: true}) refetches from offset 0 and re-renders the
+// list. Because activityTypes is never changed, this never touches
+// SoundCloud's order-sensitive collection pool — the collection object is
+// reused and every call is a genuine fresh fetch, with no stale-cache
+// restoration across repeated switches (verified across 3 back-to-back runs).
+// The XHR open() patch rewrites the fetch's activityTypes to match the active
+// tab. Two mechanisms were tried and rejected: (1) view._initCollection() +
+// rerender() — a SILENT NO-OP when activityTypes is unchanged (the pool
+// returns the same cached instance); (2) alternating activityTypes orderings —
+// ping-pongs between two stale cached collections after the first two switches
+// (the pool is order-sensitive and caches each ordering).
+
+const scfInternals = {wpr: null, registry: null};
+let scfResetGeneration = 0; // bumped per softResetFeed; a superseded reset skips its wedge check
+let scfStreamSendCount = 0; // total stream XHRs sent; lets softResetFeed verify its fetch went out
+const scfInflightStreamXhrs = new Set(); // in-flight stream XHRs, tracked so softResetFeed can abort them
+
+// Extracts webpack's internal require function via the legacy webpackJsonp
+// chunk-push trick (SoundCloud uses the pre-webpack-5 array-push runtime).
+function getWebpackRequire() {
+    if (scfInternals.wpr) return scfInternals.wpr;
+    const jsonp = window.webpackJsonp;
+    if (!Array.isArray(jsonp)) throw new Error("webpackJsonp not found");
+    let captured = null;
+    const probeId = "scf-probe-" + Math.random().toString(36).slice(2);
+    jsonp.push([[], {[probeId]: (module, exports, req) => { captured = req; }}, [[probeId]]]);
+    if (typeof captured !== "function" || !captured.c) {
+        throw new Error("webpack require capture failed");
+    }
+    scfInternals.wpr = captured;
+    return captured;
+}
+
+// Locates SoundCloud's named-object registry by shape: a cached module whose
+// exports expose .get(name) where .get("router") returns the live router (an
+// object with a currentLayout). Probing arbitrary modules can throw; each
+// candidate is isolated in its own try/catch.
+function findRouterRegistry(wpr) {
+    if (scfInternals.registry) return scfInternals.registry;
+    for (const id of Object.keys(wpr.c)) {
+        try {
+            const exp = wpr.c[id] && wpr.c[id].exports;
+            if (!exp || typeof exp.get !== "function") continue;
+            const router = exp.get("router");
+            if (router && typeof router === "object" && "currentLayout" in router) {
+                scfInternals.registry = exp;
+                return exp;
+            }
+        } catch (_e) {
+            // not the registry — keep scanning
+        }
+    }
+    throw new Error("router registry module not found");
+}
+
+// Resolves the live feed list view. Never cached: the layout and its views
+// are replaced on SPA navigation, so a cached view would go stale.
+function findStreamListView() {
+    const registry = findRouterRegistry(getWebpackRequire());
+    const layout = registry.get("router")?.currentLayout;
+    const contentView = layout?._currentViews?.["l-content"];
+    if (!contentView || !Array.isArray(contentView.subviews)) {
+        throw new Error("stream page view not found");
+    }
+    const matches = contentView.subviews.filter((sv) =>
+        sv &&
+        sv.collection &&
+        typeof sv.collection.empty === "function" &&
+        typeof sv.collection.fetch === "function" &&
+        sv.collection.getSourceInfo?.()?.type === "stream"
+    );
+    if (matches.length !== 1) {
+        throw new Error(`expected exactly 1 stream list view, found ${matches.length}`);
+    }
+    return matches[0];
+}
+
+// Refreshes the live stream feed in place. empty() clears the current
+// collection's models and pagination state; fetch({reset: true}) refetches
+// from offset 0. The collection object is reused (activityTypes untouched → the
+// order-sensitive pool is never involved), so this is a genuine fresh fetch
+// every call. The XHR open() patch rewrites the request's activityTypes to
+// match the active tab.
+//
+// In-flight stream requests are aborted FIRST. SoundCloud won't start a new
+// fetch while one is already in flight (so the reset would be silently skipped),
+// and a late in-flight page can append stale items to the just-reset feed.
+//
+// view.rerender() right after empty() is THE load-bearing line. Fetching while
+// the lazy list still holds many stale item views (~35+, i.e. after scrolling;
+// never at one page's worth) makes SoundCloud's reset handler throw
+// (getListItemView hits a pooled view whose model is gone:
+// "undefined.getEquivalencyKey", onCollectionReset → syncItems). That exception
+// fires inside jQuery's done-queue for the reset request and silently kills
+// every callback behind it: the cleanup that removes the request from the
+// collection's URL-keyed _requests map never runs, and since fetch() returns
+// any existing _requests entry instead of fetching, every later reset (always
+// the same offset=0 URL) is silently skipped — feed dead on ALL tabs until a
+// hard reload, with no error surfacing anywhere. Rerendering first empties the
+// view pool, so the reset response syncs against clean state and the exception
+// never fires. (This same exception also caused the stale-rows-after-switch
+// symptom that the former post-reset re-sync loop worked around.)
+//
+// Rejects (→ caller reloads) when the SoundCloud internals can't be found, or
+// when the wedge check sees that fetch() issued no stream request — either way
+// the reset demonstrably did not happen and a reload is warranted.
+async function softResetFeed() {
+    const view = findStreamListView();
+    const coll = view.collection;
+    const gen = ++scfResetGeneration;
+    for (const xhr of scfInflightStreamXhrs) {
+        try { xhr.abort(); } catch (_e) { /* already settled */ }
+    }
+    scfInflightStreamXhrs.clear();
+    const sendsBefore = scfStreamSendCount;
+    coll.empty();
+    view.rerender();
+    window.scrollTo(0, 0);
+    coll.fetch({reset: true});
+    // Wedge check: a skipped fetch (stale _requests entry, changed internals, …)
+    // fails silently, so verify a stream request actually went out. Checks the
+    // REQUEST, never the response: heavy-filter tabs auto-paginate for many
+    // seconds hunting for matches, and a slow response must not cause a reload.
+    await new Promise((r) => setTimeout(r, 1500));
+    if (scfResetGeneration !== gen) return; // superseded by a newer switch
+    if (scfStreamSendCount === sendsBefore) {
+        throw new Error("reset fetch issued no stream request — feed is wedged");
+    }
+}
 
 (function () {
     const seenIds = new Set();
+    // Skip counters for the loading-spinner info text; reset on every feed reset.
+    let scfSkipped = 0; // items hidden by the active filter in this feed view
+    let scfScanned = 0; // total items seen in this feed view
     // Start fetching followings immediately — no await here is intentional.
     const followings = getFollowingIdsAndUsernames();
-    const config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
+    // Mutable: re-read from the dataset on every scf:apply-config event.
+    let config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
+
+    // Shows "Skipped X items out of Y" inside SoundCloud's infinite-scroll
+    // spinner (div.loading) while it is visible, so a longer load reads as the
+    // filter working rather than the page hanging. Called from the response
+    // handler (below) as each page loads — the spinner is still on screen then.
+    // NOTE: do NOT drive this from a MutationObserver on the feed subtree — the
+    // textContent write below is itself a subtree mutation and would re-trigger
+    // the observer in an infinite loop, hanging the page. The value-guard keeps
+    // the write idempotent regardless.
+    function scfUpdateSkipInfo() {
+        const text = scfScanned > 0 ? `Skipped ${scfSkipped} items out of ${scfScanned}` : "";
+        for (const spinner of document.querySelectorAll(".stream__list .loading")) {
+            let info = spinner.querySelector(".scf-skip-info");
+            if (!info) {
+                // SoundCloud's .loading is a flex row; let it wrap so the info
+                // sits on its own line below the spinner (flex:0 0 100%).
+                spinner.style.flexWrap = "wrap";
+                info = document.createElement("div");
+                info.className = "scf-skip-info";
+                info.style.cssText = "flex:0 0 100%;padding-top:14px;font-size:14px;line-height:1.4;text-align:center;color:#999;";
+                spinner.appendChild(info);
+            }
+            if (info.textContent !== text) info.textContent = text;
+        }
+    }
 
     // Capture the request URL in open() so it is available in send().
     // open() always precedes send() in the XHR lifecycle.
@@ -422,32 +611,81 @@ function shouldStopLoadingFeed(settings, responseCollection) {
         const onload = xhr.onload;
         // Only intercept stream requests that have an onload handler.
         if (onload && xhr._scf_url && xhr._scf_url.startsWith("https://api-v2.soundcloud.com/stream?")) {
+            // Track in-flight so softResetFeed can abort it; loadend fires for
+            // success, error, AND abort, so the entry is always cleaned up.
+            scfStreamSendCount++;
+            scfInflightStreamXhrs.add(xhr);
+            xhr.addEventListener("loadend", () => scfInflightStreamXhrs.delete(xhr));
             xhr.onload = function (event) {
+                // Always hand control back to SoundCloud's original onload, even if
+                // our filtering fails — otherwise SC's fetch never completes and the
+                // request hangs. finish() runs on the happy path, on any parse/filter
+                // error (response passed through untouched), and even if the followings
+                // lookup rejects.
+                const finish = () => onload.call(xhr, event);
                 followings.then((followingData) => {
-                    const responseData = JSON.parse(xhr.responseText);
-                    if (config) {
-                        responseData.collection = responseData.collection.filter((item) => {
-                            const label = item.track?.title ?? item.playlist?.title ?? item.type;
-                            if (config.type === "deepCuts") {
-                                const passes = applyDeepCutsFilter(item);
-                                if (config?.debug) console.log(`[SCF] ${passes ? "SHOWN" : "FILTERED: deep cuts"} [${item.type}] "${label}"`);
-                                return passes;
-                            }
-                            const debug = config?.debug ? {checks: []} : null;
-                            const remove = shouldFilterItem(item, config.settings, followingData, seenIds, debug);
-                            if (config?.debug) console.log(`[SCF] ${remove ? "FILTERED" : "SHOWN"} [${item.type}] "${label}" — ${debug.checks.join(" | ")}`);
-                            return !remove;
-                        });
+                    try {
+                        if (config) {
+                            const responseData = JSON.parse(xhr.responseText);
+                            // The stop check must see the raw page: items that survive
+                            // filtering always satisfy the age cap, so the filtered
+                            // collection could never trip it.
+                            const rawCollection = responseData.collection;
+                            responseData.collection = rawCollection.filter((item) => {
+                                const label = item.track?.title ?? item.playlist?.title ?? item.type;
+                                if (config.type === "deepCuts") {
+                                    const passes = applyDeepCutsFilter(item);
+                                    if (config?.debug) console.log(`[SCF] ${passes ? "SHOWN" : "FILTERED: deep cuts"} [${item.type}] "${label}"`);
+                                    return passes;
+                                }
+                                const debug = config?.debug ? {checks: []} : null;
+                                const remove = shouldFilterItem(item, config.settings, followingData, seenIds, debug);
+                                if (config?.debug) console.log(`[SCF] ${remove ? "FILTERED" : "SHOWN"} [${item.type}] "${label}" — ${debug.checks.join(" | ")}`);
+                                return !remove;
+                            });
 
-                        if (config?.settings && shouldStopLoadingFeed(config.settings, responseData.collection)) {
-                            responseData.next_href = null;
+                            // Update the spinner's "Skipped X out of Y" counters.
+                            scfScanned += rawCollection.length;
+                            scfSkipped += rawCollection.length - responseData.collection.length;
+                            scfUpdateSkipInfo();
+
+                            if (config?.settings && shouldStopLoadingFeed(config.settings, rawCollection)) {
+                                responseData.next_href = null;
+                            }
+                            Object.defineProperty(xhr, "responseText", {value: JSON.stringify(responseData), configurable: true});
                         }
+                    } catch (e) {
+                        // Non-JSON / rate-limited / unexpected-shape response. Never
+                        // let filtering break SoundCloud — leave responseText untouched.
+                        if (config?.debug) console.warn("[SCF] response passed through unfiltered:", e);
                     }
-                    Object.defineProperty(xhr, "responseText", {value: JSON.stringify(responseData)});
-                    onload.call(xhr, event);
-                });
+                    finish();
+                }, finish);
             };
         }
         send.call(this, data);
     };
+
+    // Config updates from content.js. "update-only" swaps the config used for
+    // future requests; "reset-feed" additionally clears session state and
+    // rebuilds the feed in place, falling back to a full reload on failure.
+    // State was persisted by content.js before dispatching, so a fallback
+    // reload boots into the correct tab.
+    document.addEventListener("scf:apply-config", (event) => {
+        config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
+        if (event.detail !== "reset-feed") return;
+        seenIds.clear();
+        scfSkipped = 0;
+        scfScanned = 0;
+        scfUpdateSkipInfo();
+        // softResetFeed rejects when the SoundCloud internals can't be found or
+        // when its wedge check saw no stream request go out — either way the
+        // reset demonstrably didn't happen, so fall back to a full reload. State
+        // was already persisted by content.js, so the reload boots into the
+        // correct tab.
+        softResetFeed().catch((err) => {
+            console.error("[SCF] soft feed reset failed — falling back to reload:", err);
+            window.location.reload();
+        });
+    });
 })();

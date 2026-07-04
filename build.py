@@ -1,43 +1,42 @@
-import fnmatch
 import json
-import os
 from pathlib import Path
 from zipfile import ZipFile
-with open("manifest_v3.json") as f:
-    manifest = json.load(f)
-    version = manifest["version"]
 
-IGNORE_FILES = [
-    "icons/icon512.png",
-    "docs/*",
-    ".gitignore",
-    ".git/*",
-    "README.md",
-    "build/*",
-    "manifest_*",
-    "manifest.json",
-    "build.py",
-    ".DS_Store"
+# Allowlist by design: ONLY these files are ever packaged. New tooling or
+# editor dirs can never leak into a release because they are simply not on
+# this list.
+INCLUDE_GLOBS = [
+    "src/*.js",
+    "icons/icon16.png",
+    "icons/icon32.png",
+    "icons/icon48.png",
+    "icons/icon128.png",
 ]
 
-def ignore_file(file: Path):
-    if file.is_dir():
-        return True
-    for ignore in IGNORE_FILES:
-        if fnmatch.fnmatch(str(file), ignore):
-            return True
+with open("manifest_v3.json") as f:
+    version = json.load(f)["version"]
 
+files = sorted(
+    {path for glob in INCLUDE_GLOBS for path in Path(".").glob(glob) if path.is_file()}
+)
 
-os.makedirs("build", exist_ok=True)
-with ZipFile(f"build/sc-filter-{version}-mv2.zip", "w") as zip:
-    files = [file for file in Path(".").rglob("*") if not ignore_file(file)]
-    for file in files:
-        zip.write(file)
-    with open("manifest_v2.json") as f:
-        zip.writestr("manifest.json", f.read())
-with ZipFile(f"build/sc-filter-{version}-mv3.zip", "w") as zip:
-    files = [file for file in Path(".").rglob("*") if not ignore_file(file)]
-    for file in files:
-        zip.write(file)
-    with open("manifest_v3.json") as f:
-        zip.writestr("manifest.json", f.read())
+# (zip name, manifest to write in as manifest.json)
+targets = [
+    (f"build/sc-filter-{version}-mv2.zip", "manifest_v2.json"),
+    (f"build/sc-filter-{version}-mv3.zip", "manifest_v3.json"),
+]
+
+Path("build").mkdir(exist_ok=True)
+for zip_path, manifest_src in targets:
+    with ZipFile(zip_path, "w") as zip:
+        for file in files:
+            zip.write(file)
+        with open(manifest_src) as f:
+            zip.writestr("manifest.json", f.read())
+
+print(f"Packaged v{version} ({len(files) + 1} files each):")
+for file in files:
+    print(f"  {file}")
+print("  manifest.json (from manifest_v2.json / manifest_v3.json)")
+for zip_path, _ in targets:
+    print(f"-> {zip_path}")

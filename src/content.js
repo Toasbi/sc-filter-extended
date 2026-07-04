@@ -23,6 +23,10 @@ const VALID_FILTER_REPOSTS_TYPES = new Set([
 
 const VALID_PLAYLIST_FILTER_MODES = new Set(["hideLarge", "hideAll"]);
 
+// External links shown in the global settings panel.
+const BUY_ME_A_COFFEE_URL = "https://buymeacoffee.com/toaster2";
+const GITHUB_ISSUES_URL = "https://github.com/Toasbi/sc-filter-extended/issues";
+
 // ── Pure: settings helpers ────────────────────────────────────────────────────
 
 // Deep-merges `stored` into `defaults`, applying defaults for any key
@@ -188,10 +192,6 @@ function uniqueName(name, existingNames) {
     return `${name} (${n})`;
 }
 
-function restoredTabs(defaults) {
-    return defaults;
-}
-
 // Returns tabs with the entry matching `id` removed and the new active id.
 // Precondition: tabs.length > 1 (caller must not call when only 1 tab remains).
 function tabsAfterDelete(tabs, id) {
@@ -243,25 +243,41 @@ async function save(tabs, activeTabId) {
     await browser.storage.sync.set({scFilterTabs: tabs, scActiveTabId: activeTabId});
 }
 
-async function saveAndReload(tabs, activeTabId) {
+// Writes the active tab config (plus the debug flag) to the DOM and notifies
+// filter.js. intent must be "reset-feed" (rebuild the feed from scratch) or
+// "update-only" (swap the config for future requests, keep the feed as-is).
+// The event payload is a plain string — objects don't cross the
+// content-script ↔ page boundary cleanly in Firefox.
+function applyConfig(tabConfig, debug, intent) {
+    document.documentElement.dataset.scfConfig = JSON.stringify({...tabConfig, debug});
+    document.dispatchEvent(new CustomEvent("scf:apply-config", {detail: intent}));
+}
+
+// Persists state, then pushes the new active config into the page and asks
+// filter.js to rebuild the feed in place (no page reload). If the in-place
+// rebuild fails, filter.js itself falls back to window.location.reload() —
+// state is already persisted at that point, so the reload boots into the
+// correct tab either way.
+async function saveAndResetFeed(tabs, activeTabId) {
     await save(tabs, activeTabId);
-    window.location.reload();
+    const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+    const {debug} = await loadState();
+    applyConfig(activeTab, debug, "reset-feed");
 }
 
 // ── Impure: script injection ──────────────────────────────────────────────────
 
-// Injects filter.js into the page context and writes the active config to the DOM.
-// Safe to call multiple times per page load: the filter script guard prevents double-injection.
-// Design constraint: the active tab config is static per page load. Saving the active
-// tab always goes through saveAndReload() (full reload). Saving an inactive tab or
-// adding a new tab calls initFilters() but never changes the active tab — so filter.js
-// always holds the correct config.
+// Injects filter.js into the page context and pushes the active config.
+// Safe to call multiple times per page load: the filter script guard prevents
+// double-injection, and repeated "update-only" config pushes are idempotent.
 function injectFilterScripts(tabConfig, debug) {
-    // IMPORTANT: dataset write must come before the filterScript append.
-    // filter.js reads document.documentElement.dataset.scfConfig once at IIFE load time.
-    // The <script src> tag executes asynchronously (after fetch + parse), so the attribute
-    // is guaranteed to be set before filter.js runs — but only if this line comes first.
-    document.documentElement.dataset.scfConfig = JSON.stringify({...tabConfig, debug});
+    // IMPORTANT: applyConfig's dataset write must come before the filterScript
+    // append. filter.js reads document.documentElement.dataset.scfConfig once
+    // at IIFE load time (and re-reads it on every scf:apply-config event
+    // afterwards). The <script src> tag executes asynchronously (after
+    // fetch + parse), so the attribute is guaranteed to be set before
+    // filter.js first runs — but only if the applyConfig call comes first.
+    applyConfig(tabConfig, debug, "update-only");
     if (!document.getElementById("scf-filter-script")) {
         const filterScript = document.createElement("script");
         filterScript.id = "scf-filter-script";
@@ -306,6 +322,10 @@ function injectStyles() {
       overflow: visible;
       height: auto;
       min-height: 0;
+      position: sticky;
+      top: var(--header-height, 46px);
+      z-index: 100;
+      background: var(--background-surface-color, var(--scf-bg));
     }
     #scf-tab-bar {
       display: flex;
@@ -769,6 +789,52 @@ function injectStyles() {
       cursor: pointer;
     }
     #scf-global-panel .scf-restore-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+    #scf-global-panel .scf-global-links {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--scf-border);
+    }
+    /* Help link — matches the restore button above it */
+    #scf-global-panel .scf-help-btn {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      font-size: 13px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      text-align: center;
+      text-decoration: none;
+      background: var(--scf-bg-input);
+      color: var(--scf-text-2);
+      border: 1px solid var(--scf-border-ctrl);
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #scf-global-panel .scf-help-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+    /* Buy Me a Coffee brand banner */
+    #scf-global-panel .scf-coffee-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #ffdd00;
+      color: #000000;
+      border: 1px solid #ffdd00;
+      border-radius: 4px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    #scf-global-panel .scf-coffee-btn:hover { background: #ffe74d; border-color: #ffe74d; }
+    #scf-global-panel .scf-coffee-btn svg { display: block; }
   `;
     document.head.appendChild(style);
 }
@@ -1017,6 +1083,13 @@ function buildGlobalPanel(debug) {
       <button class="scf-close-btn" title="Close">×</button>
     </div>
     <div class="scf-body">
+      <div class="scf-global-links">
+        <a class="scf-coffee-btn" href="${BUY_ME_A_COFFEE_URL}" target="_blank" rel="noopener noreferrer">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M20.216 6.415l-.132-.666c-.119-.598-.388-1.163-1.001-1.379-.197-.069-.42-.098-.57-.241-.152-.143-.196-.366-.231-.572-.065-.378-.125-.756-.192-1.133-.057-.325-.102-.69-.25-.987-.195-.4-.597-.634-.996-.788a5.723 5.723 0 00-.626-.194c-1-.263-2.05-.36-3.077-.416a25.834 25.834 0 00-3.7.062c-.915.083-1.88.184-2.75.5-.318.116-.646.256-.888.501-.297.302-.393.77-.177 1.146.154.267.415.456.692.58.36.162.737.284 1.123.366 1.075.238 2.189.331 3.287.37 1.218.05 2.437.01 3.65-.118.299-.033.598-.073.896-.119.352-.054.578-.513.474-.834-.124-.383-.457-.531-.834-.473-.466.074-.96.108-1.382.146-1.177.08-2.358.082-3.536.006a22.228 22.228 0 01-1.157-.107c-.086-.01-.18-.025-.258-.036-.243-.036-.484-.08-.724-.13-.111-.027-.111-.185 0-.212h.005c.277-.06.557-.108.838-.147h.002c.131-.009.263-.032.394-.048a25.076 25.076 0 013.426-.12c.674.019 1.347.067 2.017.144l.228.031c.267.04.533.088.798.145.392.085.895.113 1.07.542.055.137.08.288.111.431l.319 1.484a.237.237 0 01-.199.284h-.003c-.037.006-.075.01-.112.015a36.704 36.704 0 01-4.743.295 37.059 37.059 0 01-4.699-.304c-.14-.017-.293-.042-.417-.06-.326-.048-.649-.108-.973-.161-.393-.065-.768-.032-1.123.161-.29.16-.527.404-.675.701-.154.316-.199.66-.267 1.001-.069.34-.176.707-.135 1.056.087.753.613 1.365 1.37 1.502a39.69 39.69 0 0011.343.376.483.483 0 01.535.53l-.071.697-1.018 9.907c-.041.41-.047.832-.125 1.237-.122.637-.553 1.028-1.182 1.171-.577.131-1.165.2-1.756.205-.656.004-1.31-.025-1.966-.022-.699.004-1.556-.06-2.095-.58-.475-.458-.54-1.174-.605-1.793l-.731-7.13-.322-3.152c-.037-.36-.351-.634-.708-.618-.339.014-.618.322-.579.694l.318 3.106.907 8.844c.083.808.83 1.6 1.664 1.789.905.204 1.803.238 2.719.243 1.19.007 2.401.007 3.567-.238.85-.178 1.696-.579 2.077-1.412.145-.318.244-.686.312-1.027.09-.457.14-.919.19-1.379l.24-2.2.522-4.789.19-1.751a.237.237 0 01.264-.209c.31.045.63.108.94.16.42.07.844.14 1.267.212 1.24.207 2.454.481 3.685.717.35.067.7.146 1.05.187a.237.237 0 01.208.263l-.174 1.61c-.041.376.207.7.579.72.339.017.626-.247.663-.585l.393-3.625c.017-.16.017-.322-.02-.48z"/></svg>
+          <span>Buy me a coffee</span>
+        </a>
+        <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
+      </div>
       <button class="scf-restore-btn" id="scf-restore-btn">Restore default tabs</button>
       <div class="scf-row">
         <span class="scf-row-label">Debug logging <span class="scf-help" data-tip="Logs each feed item and why it was shown or filtered to the browser console (DevTools → Console).">?</span></span>
@@ -1380,7 +1453,12 @@ async function initFilters() {
     attachTabBarListeners(tabBarEl, {
         onTabClick: async (id) => {
             const {tabs, activeTabId} = await loadState();
-            if (id !== activeTabId) await saveAndReload(tabs, id);
+            if (id === activeTabId) return;
+            await saveAndResetFeed(tabs, id);
+            // The tab set is unchanged — just move the active highlight.
+            for (const li of tabBarEl.querySelectorAll("[data-tab-id]")) {
+                li.querySelector(".g-tabs-link").classList.toggle("active", li.dataset.tabId === id);
+            }
         },
         onGearClick: async (id) => {
             const {tabs, activeTabId} = await loadState();
@@ -1392,7 +1470,9 @@ async function initFilters() {
                 onSave: async (updatedTab) => {
                     const newTabs = tabs.map((t) => (t.id === updatedTab.id ? updatedTab : t));
                     if (updatedTab.id === activeTabId) {
-                        await saveAndReload(newTabs, activeTabId);
+                        await saveAndResetFeed(newTabs, activeTabId);
+                        document.getElementById("scf-settings-panel")?.remove();
+                        initFilters(); // tab name may have changed — rebuild the tab bar
                     } else {
                         await save(newTabs, activeTabId);
                         document.getElementById("scf-settings-panel")?.remove();
@@ -1405,7 +1485,9 @@ async function initFilters() {
                     if (!confirm("Delete this filter?")) return;
                     const {tabs: newTabs, newActiveId} = tabsAfterDelete(tabs, id);
                     if (id === activeTabId) {
-                        await saveAndReload(newTabs, newActiveId);
+                        await saveAndResetFeed(newTabs, newActiveId);
+                        document.getElementById("scf-settings-panel")?.remove();
+                        initFilters();
                     } else {
                         await save(newTabs, activeTabId);
                         document.getElementById("scf-settings-panel")?.remove();
@@ -1422,13 +1504,16 @@ async function initFilters() {
             openGlobalPanel({
                 debug,
                 onRestore: async () => {
-                    await saveAndReload(restoredTabs(buildDefaultTabs()), buildDefaultTabs()[0].id);
+                    const defaults = buildDefaultTabs();
+                    await saveAndResetFeed(defaults, defaults[0].id);
+                    document.getElementById("scf-global-panel")?.remove();
+                    initFilters();
                 },
                 onDebugChange: async (enabled) => {
                     await browser.storage.sync.set({scfDebug: enabled});
-                    if (enabled && confirm("Reload page to enable debug logging?")) {
-                        window.location.reload();
-                    }
+                    const {tabs, activeTabId} = await loadState();
+                    const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+                    applyConfig(activeTab, enabled, "update-only");
                 },
                 onClose: () => {
                     document.getElementById("scf-global-panel")?.remove();
