@@ -1,8 +1,11 @@
+[![Chrome Web Store](https://img.shields.io/badge/Chrome%20Web%20Store-4285F4?logo=googlechrome&logoColor=white)](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
+[![Firefox Add-ons](https://img.shields.io/badge/Firefox%20Add--ons-FF7139?logo=firefox-browser&logoColor=white)](https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-extended/)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/toaster2)
+
 # SoundCloud Feed Filter Extended
 
 Browser extension that adds filtering to your [SoundCloud feed](https://soundcloud.com/feed).
 Create multiple filter presets and switch between them with a tab bar.
-Disclaimer: This is mostly vibe coded, dont expect perfect code :)
 
 ![Example](/docs/screenshot.png)
 ![Example2](/docs/screenshotdark.png)
@@ -10,17 +13,26 @@ Disclaimer: This is mostly vibe coded, dont expect perfect code :)
 
 ## Installation
 
-[Chrome](https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal)
+Chrome: https://chromewebstore.google.com/detail/soundcloud-feed-filter-ex/mnfcpieidcneompnhaamejajfodlclal
 
-[Firefox](https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-extended/)
+Firefox: https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-extended/
 
 
-## Credits
+## Adding a filter tab
 
-This extension is based/inspired on these extensions:
-- [SoundCloud Feed Filter](https://github.com/7x11x13/sc-filter) by [7x11x13](https://github.com/7x11x13).
-- [SoundCloud repost blocker](https://github.com/apsun/sc-repost-blocker) by [apsun](https://github.com/apsun).
+1. Click + in the tab bar to create a new tab
+2. Give it a name and configure the filters
+3. Click Save — the tab appears in the bar as the last item
+4. Switch between tabs to instantly change your feed view
 
+## Editing/Deleting a filter tab
+
+1. Hover over a tab in the tab bar, a pencil icon appears on the right
+2. Click the pencil icon on the right side of the tab name
+3. Adjust the settings to your liking and Click Save
+4. Or Click Delete on the left bottom of the settings panel  
+  
+**Note**: You can always restore the default Filter Tabs by clicking the gear icon in the tab bar.
 
 ## Filters
 
@@ -46,12 +58,8 @@ The extension ships with these pre-configured tabs:
 - **New Free Downloads** — same as Free Downloads but limited to uploads from the last 7 days
 - **Deep cuts** — tracks from small or under-the-radar artists; surfaces music you'd otherwise miss
 
-## Adding a filter tab
+## Credits
 
-1. Click + in the tab bar to create a new tab
-2. Give it a name and configure the filters
-3. Click Save — the tab appears in the bar as the last item
-4. Switch between tabs to instantly change your feed view
-
-
-
+This extension is based/inspired on these extensions:
+- [SoundCloud Feed Filter](https://github.com/7x11x13/sc-filter) by [7x11x13](https://github.com/7x11x13).
+- [SoundCloud repost blocker](https://github.com/apsun/sc-repost-blocker) by [apsun](https://github.com/apsun).
