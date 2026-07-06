@@ -7,8 +7,8 @@
 Browser extension that adds filtering to your [SoundCloud feed](https://soundcloud.com/feed).
 Create multiple filter presets and switch between them with a tab bar.
 
+![Demo](/docs/soundcloud-feed.gif)
 ![Example](/docs/screenshot.png)
-![Example2](/docs/screenshotdark.png)
 
 
 ## Installation
