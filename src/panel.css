@@ -1,0 +1,590 @@
+body.theme-dark {
+  --scf-bg: #1a1a1a;
+  --scf-bg-input: #2a2a2a;
+  --scf-bg-hover: #333333;
+  --scf-border: #333333;
+  --scf-border-row: #222222;
+  --scf-border-ctrl: #444444;
+  --scf-text: #e0e0e0;
+  --scf-text-2: #bbbbbb;
+  --scf-text-muted: #888888;
+  --scf-text-dim: #666666;
+}
+body.theme-light {
+  --scf-bg: #ffffff;
+  --scf-bg-input: #f5f5f5;
+  --scf-bg-hover: #e8e8e8;
+  --scf-border: #dddddd;
+  --scf-border-row: #ebebeb;
+  --scf-border-ctrl: #d0d0d0;
+  --scf-text: #222222;
+  --scf-text-2: #444444;
+  --scf-text-muted: #767676;
+  --scf-text-dim: #999999;
+}
+/* ── Tab bar additions ─────────────────────────── */
+#scf-stream-header {
+  overflow: visible;
+  height: auto;
+  min-height: 0;
+  position: sticky;
+  top: var(--header-height, 46px);
+  z-index: 100;
+  background: var(--background-surface-color, var(--scf-bg));
+}
+#scf-tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  flex-direction: row;
+  white-space: normal;
+  overflow: visible;
+  justify-content: flex-start;
+  align-items: center;
+  height: auto;
+  min-height: 0;
+}
+#scf-tab-bar .g-tabs-item[data-tab-id],
+#scf-tab-bar .scf-global-gear-item,
+#scf-tab-bar .scf-add-item,
+#scf-tab-bar .scf-info-item {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  margin: 0 2px 0 2px;
+}
+#scf-tab-bar .g-tabs-item[data-tab-id] .g-tabs-link {
+  position: relative;
+  text-align: center;
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.scf-gear-btn {
+  position: absolute;
+  right: -4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--scf-text-muted);
+  padding: 0;
+  line-height: 0;
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+/* Show gear when the tab item is hovered */
+.g-tabs-item[data-tab-id]:hover .scf-gear-btn {
+  opacity: 0.7;
+}
+.g-tabs-item[data-tab-id]:hover .scf-gear-btn:hover {
+  opacity: 1;
+  color: var(--scf-text-2);
+}
+/* global gear and add links — use g-tabs-link for automatic height alignment */
+#scf-tab-bar .scf-global-gear-link,
+#scf-tab-bar .scf-add-link {
+  display: inline-flex;
+  align-items: center;
+  color: var(--scf-text-muted);
+  opacity: 0.8;
+}
+#scf-tab-bar .scf-global-gear-link:hover { opacity: 1; color: var(--scf-text-2); }
+#scf-tab-bar .scf-add-link {
+  font-size: 16px;
+  line-height: 1;
+  padding-left: 6px;
+}
+#scf-tab-bar .scf-add-link:hover { color: #ff5500; opacity: 1; }
+#scf-tab-bar .scf-info-link {
+  display: inline-flex;
+  align-items: center;
+  color: var(--scf-text-muted);
+  opacity: 0.8;
+}
+#scf-tab-bar .scf-info-link:hover,
+#scf-tab-bar .scf-info-open .scf-info-link { opacity: 1; color: var(--scf-text-2); }
+#scf-tab-bar .scf-info-body {
+  display: none;
+  align-items: center;
+  gap: 5px;
+  padding-left: 4px;
+  font-size: 12px;
+  color: var(--scf-text-2);
+  font-variant-numeric: tabular-nums;
+}
+#scf-tab-bar .scf-info-open .scf-info-body { display: inline-flex; }
+#scf-tab-bar .scf-info-body [hidden] { display: none; }
+#scf-tab-bar .scf-info-muted,
+#scf-tab-bar .scf-info-sep { color: var(--scf-text-muted); }
+
+/* ── Settings panel ────────────────────────────── */
+#scf-settings-panel, #scf-global-panel {
+  position: fixed;
+  top: 60px;
+  right: 16px;
+  z-index: 9999;
+  background: var(--scf-bg);
+  color: var(--scf-text);
+  border-radius: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  width: 260px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+  user-select: none;
+  border: 1px solid var(--scf-border);
+}
+#scf-settings-panel .scf-panel-header,
+#scf-global-panel .scf-panel-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  gap: 8px;
+  border-bottom: 1px solid var(--scf-border);
+}
+#scf-settings-panel .scf-name-input {
+  flex: 1;
+  background: var(--scf-bg-input);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 4px;
+  color: var(--scf-text);
+  font-size: 13px;
+  padding: 4px 8px;
+  outline: none;
+}
+#scf-settings-panel .scf-name-input:focus {
+  border-color: #ff5500;
+}
+#scf-global-panel .scf-panel-title {
+  flex: 1;
+  font-weight: 500;
+  font-size: 13px;
+}
+.scf-close-btn {
+  background: none;
+  border: none;
+  color: var(--scf-text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+}
+.scf-close-btn:hover { color: var(--scf-text); }
+
+#scf-settings-panel .scf-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.scf-section-header {
+  padding: 6px 12px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--scf-text-dim);
+  border-bottom: 1px solid var(--scf-border-row);
+}
+.scf-row {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  gap: 8px;
+  border-bottom: 1px solid var(--scf-border-row);
+}
+.scf-row-label {
+  flex: 1;
+  font-size: 12px;
+  color: var(--scf-text-2);
+  line-height: 1.3;
+}
+.scf-help {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--scf-text-dim);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 50%;
+  cursor: default;
+  position: relative;
+  margin-left: 4px;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+#scf-tooltip {
+  position: fixed;
+  background: var(--scf-bg-input);
+  color: var(--scf-text);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.4;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--scf-border-ctrl);
+  width: 180px;
+  white-space: normal;
+  z-index: 99999;
+  pointer-events: none;
+  display: none;
+}
+.scf-toggle {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.scf-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+.scf-toggle-track {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--scf-border-ctrl);
+  border-radius: 9px;
+  transition: background 0.2s;
+}
+.scf-toggle input:checked + .scf-toggle-track { background: #ff5500; }
+.scf-toggle-track::after {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.2s;
+}
+.scf-toggle input:checked + .scf-toggle-track::after { transform: translateX(14px); }
+.scf-row-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.scf-row-disabled .scf-help {
+  pointer-events: auto;
+}
+#scf-pf-nit-row, #scf-as-source-row, #scf-seen-retention-row {
+  border-bottom: none;
+}
+/* Inline next to a row label, buttons size to their text instead of filling the panel */
+.scf-row > .scf-segmented { flex-shrink: 0; }
+.scf-row > .scf-segmented .scf-seg-btn { padding: 4px 8px; }
+
+/* Segmented control for filterReposts.type */
+.scf-sub-section {
+  display: none;
+  padding: 6px 12px 10px;
+  border-bottom: 1px solid var(--scf-border-row);
+}
+.scf-sub-section.scf-visible { display: block; }
+/* Padding lines the counts up with the "Hide tracks seen in" row label */
+.scf-seen-count {
+  padding: 2px 12px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--scf-text-2);
+  font-variant-numeric: tabular-nums;
+}
+.scf-seen-count-muted { color: var(--scf-text-muted); }
+.scf-seen-reset {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--scf-text-muted);
+  cursor: pointer;
+}
+.scf-seen-reset:hover { color: #e04040; }
+.scf-filter-info {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--scf-text-muted);
+  line-height: 1.5;
+}
+.scf-segmented {
+  display: flex;
+  gap: 4px;
+}
+.scf-seg-btn {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.scf-seg-btn.scf-active {
+  background: #ff5500;
+  color: #fff;
+  border-color: #ff5500;
+}
+.scf-pf-mode-btn {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.scf-pf-mode-btn.scf-active {
+  background: #ff5500;
+  color: #fff;
+  border-color: #ff5500;
+}
+
+/* Sliders */
+.scf-slider-section {
+  display: none;
+  padding: 8px 12px 12px;
+  border-bottom: 1px solid var(--scf-border-row);
+}
+.scf-slider-section.scf-visible { display: block; }
+.scf-slider-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--scf-text-muted);
+  margin-bottom: 6px;
+}
+.scf-slider-wrap, .scf-single-wrap {
+  position: relative;
+  height: 24px;
+  display: flex;
+  align-items: center;
+}
+.scf-slider-base {
+  position: absolute;
+  left: 0; right: 0;
+  height: 4px;
+  background: var(--scf-border-ctrl);
+  border-radius: 2px;
+  pointer-events: none;
+}
+.scf-slider-fill {
+  position: absolute;
+  height: 4px;
+  background: #ff5500;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.scf-slider-wrap input[type=range],
+.scf-single-wrap input[type=range] {
+  position: absolute;
+  width: 100%;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: transparent;
+  pointer-events: none;
+  margin: 0; padding: 0;
+  height: 4px;
+}
+.scf-slider-wrap input[type=range]::-webkit-slider-runnable-track,
+.scf-single-wrap input[type=range]::-webkit-slider-runnable-track {
+  background: transparent; height: 4px;
+}
+.scf-slider-wrap input[type=range]::-webkit-slider-thumb,
+.scf-single-wrap input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  pointer-events: all;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: #ff5500;
+  border: 2px solid var(--scf-bg);
+  cursor: pointer;
+  margin-top: -5px;
+}
+.scf-slider-wrap input[type=range]::-moz-range-thumb,
+.scf-single-wrap input[type=range]::-moz-range-thumb {
+  -moz-appearance: none;
+  pointer-events: all;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: #ff5500;
+  border: 2px solid var(--scf-bg);
+  cursor: pointer;
+}
+.scf-warning {
+  display: none;
+  font-size: 11px;
+  color: #f5a623;
+  margin: 6px 0 0;
+  line-height: 1.4;
+}
+.scf-warning:not([hidden]) { display: block; }
+
+/* Tag filter */
+.scf-tag-section {
+  display: none;
+  padding: 8px 12px 12px;
+  border-bottom: 1px solid var(--scf-border-row);
+}
+.scf-tag-section.scf-visible { display: block; }
+.scf-tag-mode-row { display: flex; gap: 4px; margin-bottom: 8px; }
+.scf-tag-mode-btn {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.scf-tag-mode-btn.scf-active { background: #ff5500; color: #fff; border-color: #ff5500; }
+.scf-tag-input-row { display: flex; gap: 4px; margin-bottom: 8px; }
+.scf-tag-input {
+  flex: 1;
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--scf-bg-input);
+  color: var(--scf-text);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 3px;
+  outline: none;
+}
+.scf-tag-add-btn, .scf-tag-clear-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.scf-tag-add-btn:hover, .scf-tag-clear-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+.scf-tag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.scf-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  font-size: 11px;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 10px;
+}
+.scf-tag-chip-remove {
+  background: none; border: none; color: var(--scf-text-muted);
+  cursor: pointer; font-size: 12px; line-height: 1; padding: 0;
+}
+.scf-tag-chip-remove:hover { color: var(--scf-text); }
+
+/* Panel footer */
+.scf-panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--scf-border);
+}
+.scf-panel-footer .scf-delete-btn {
+  margin-right: auto;
+  background: none;
+  border: none;
+  color: var(--scf-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.scf-panel-footer .scf-delete-btn:hover { color: #e04040; }
+.scf-btn {
+  padding: 5px 14px;
+  font-size: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--scf-border-ctrl);
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+}
+.scf-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+.scf-btn-primary {
+  background: #ff5500;
+  border-color: #ff5500;
+  color: #fff;
+}
+.scf-btn-primary:hover { background: #e04d00; }
+
+/* Global panel body */
+#scf-global-panel .scf-body { padding: 12px; }
+#scf-global-panel .scf-restore-btn {
+  width: 100%;
+  padding: 8px;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 4px;
+  cursor: pointer;
+}
+#scf-global-panel .scf-restore-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+#scf-global-panel .scf-global-seen {
+  padding: 0 12px 10px;
+  border-bottom: 1px solid var(--scf-border-row);
+}
+#scf-global-panel .scf-global-seen .scf-seen-count { padding: 6px 0 0; }
+#scf-global-panel .scf-global-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--scf-border);
+}
+/* Help link — matches the restore button above it */
+#scf-global-panel .scf-help-btn {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-align: center;
+  text-decoration: none;
+  background: var(--scf-bg-input);
+  color: var(--scf-text-2);
+  border: 1px solid var(--scf-border-ctrl);
+  border-radius: 4px;
+  cursor: pointer;
+}
+#scf-global-panel .scf-help-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+/* Buy Me a Coffee brand banner */
+#scf-global-panel .scf-coffee-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #ffdd00;
+  color: #000000;
+  border: 1px solid #ffdd00;
+  border-radius: 4px;
+  cursor: pointer;
+  text-decoration: none;
+}
+#scf-global-panel .scf-coffee-btn:hover { background: #ffe74d; border-color: #ffe74d; }
+#scf-global-panel .scf-coffee-btn svg { display: block; }

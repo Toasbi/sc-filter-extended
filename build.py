@@ -7,6 +7,7 @@ from zipfile import ZipFile
 # this list.
 INCLUDE_GLOBS = [
     "src/*.js",
+    "src/*.css",
     "icons/icon16.png",
     "icons/icon32.png",
     "icons/icon48.png",

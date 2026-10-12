@@ -34,6 +34,15 @@ Firefox: https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-ex
   
 **Note**: You can always restore the default Filter Tabs by clicking the gear icon in the tab bar.
 
+## Tab stats
+
+Click the ⓘ icon at the end of the tab bar to show live stats next to it:
+
+- **Seen** — how many tracks have been seen in all tabs and in the active tab; the list the active tab hides against is highlighted
+- **Filtered** — how many feed items the active tab has hidden since the feed was last loaded, out of how many it checked
+
+Click ⓘ again to hide them. The extension remembers whether the stats are shown.
+
 ## Filters
 
 - **Repost filter** — block all reposts, allow only from people you follow, or show only from people you don't follow
@@ -42,7 +51,7 @@ Firefox: https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-ex
 - **Track length** — show only tracks within a duration range
 - **Content age** — control how old feed entries and uploads can be
 - **Free downloads only** — show only tracks with a free download link
-- **Hide seen tracks** — hide tracks you've already scrolled past this session
+- **Hide seen tracks** — hide tracks you've already seen, even after a refresh or restart. Each tab remembers its own seen tracks or can use those of all tabs; pause or reset anytime, and choose how long they're kept (1 month to 1 year)
 
 ## Default tabs
 

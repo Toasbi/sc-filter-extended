@@ -13,6 +13,7 @@
         {
             "matches": ["*://*.soundcloud.com/*"],
             "js": ["/src/content.js"],
+            "css": ["/src/panel.css"],
             "run_at": "document_start"
         }
     ],

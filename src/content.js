@@ -10,10 +10,19 @@ const DEFAULT_SETTINGS = {
     trackLengthInMin: {enabled: false, min: 0, max: 30},
     contentAgeInDays: {enabled: false, min: null, max: null},
     freeDownloadsOnly: {enabled: false},
-    alreadySeen: {enabled: true},
+    // mode: "on" (record + hide) | "paused" (record only) | "off" (nothing)
+    // source: which seen list to hide against — "tab" (own list) | "all" (shared list)
+    alreadySeen: {mode: "on", source: "tab"},
     playlistFilter: {enabled: false, mode: "hideLarge", nameInTitles: false},
     tagFilter: {enabled: false, mode: "include", tags: []},
 };
+
+const VALID_SEEN_MODES = new Set(["on", "paused", "off"]);
+const VALID_SEEN_SOURCES = new Set(["tab", "all"]);
+
+// How long seen tracks are kept (global, storage.sync scfSeenRetention), in months.
+const SEEN_RETENTION_LABELS = {1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year"};
+const DEFAULT_SEEN_RETENTION = 12;
 
 const VALID_FILTER_REPOSTS_TYPES = new Set([
     "allowNone",
@@ -54,7 +63,22 @@ function deepMerge(defaults, stored) {
 // with `defaults[key] !== null` to handle null default leaf values (min/max of
 // contentAgeInDays). The Array.isArray guard is load-bearing — do not remove.
 function sanitizeSettings(stored) {
+    // Legacy "Hide seen tracks" was {enabled: boolean}. Read it before
+    // deepMerge, which drops keys that aren't in DEFAULT_SETTINGS.
+    const legacySeen = stored !== null && typeof stored === "object" ? stored.alreadySeen : null;
     const s = deepMerge(DEFAULT_SETTINGS, stored);
+    if (
+        legacySeen !== null && typeof legacySeen === "object" &&
+        !("mode" in legacySeen) && typeof legacySeen.enabled === "boolean"
+    ) {
+        s.alreadySeen.mode = legacySeen.enabled ? "on" : "off";
+    }
+    if (!VALID_SEEN_MODES.has(s.alreadySeen.mode)) {
+        s.alreadySeen.mode = "on";
+    }
+    if (!VALID_SEEN_SOURCES.has(s.alreadySeen.source)) {
+        s.alreadySeen.source = "tab";
+    }
     if (!VALID_FILTER_REPOSTS_TYPES.has(s.filterReposts.type)) {
         s.filterReposts.type = "allowNone";
     }
@@ -201,6 +225,19 @@ function tabsAfterDelete(tabs, id) {
     return {tabs: newTabs, newActiveId: newTabs[newActiveIdx].id};
 }
 
+// "9,999" up to 9,999, then "12.3k", "1.2M".
+function formatCount(n) {
+    if (n < 10000) return n.toLocaleString("en-US");
+    return new Intl.NumberFormat("en-US", {notation: "compact", maximumFractionDigits: 1})
+        .format(n)
+        .replace("K", "k");
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 // ── Impure: storage ───────────────────────────────────────────────────────────
 
 async function loadState() {
@@ -209,6 +246,8 @@ async function loadState() {
             "scFilterTabs",
             "scActiveTabId",
             "scfDebug",
+            "scfSeenRetention",
+            "scfInfoOpen",
         ]);
 
         let tabs = Array.isArray(stored.scFilterTabs) ? stored.scFilterTabs : null;
@@ -216,7 +255,8 @@ async function loadState() {
             tabs = buildDefaultTabs();
         } else {
             tabs = tabs
-                .filter((t) => t && (t.type === "settings" || t.type === "deepCuts"))
+                .filter((t) => t && typeof t.id === "string" && typeof t.name === "string" &&
+                    (t.type === "settings" || t.type === "deepCuts"))
                 .map((t) => {
                     if (t.type === "settings") {
                         return {...t, settings: sanitizeSettings(t.settings)};
@@ -232,10 +272,16 @@ async function loadState() {
 
         const debug = stored.scfDebug === true;
 
-        return {tabs, activeTabId, debug};
+        const seenRetention = Number.isInteger(stored.scfSeenRetention) && stored.scfSeenRetention in SEEN_RETENTION_LABELS
+            ? stored.scfSeenRetention
+            : DEFAULT_SEEN_RETENTION;
+
+        const infoOpen = stored.scfInfoOpen === true;
+
+        return {tabs, activeTabId, debug, seenRetention, infoOpen};
     } catch (_e) {
         const tabs = buildDefaultTabs();
-        return {tabs, activeTabId: tabs[0].id, debug: false};
+        return {tabs, activeTabId: tabs[0].id, debug: false, seenRetention: DEFAULT_SEEN_RETENTION, infoOpen: false};
     }
 }
 
@@ -258,12 +304,396 @@ function applyConfig(tabConfig, debug, intent) {
 // rebuild fails, filter.js itself falls back to window.location.reload() —
 // state is already persisted at that point, so the reload boots into the
 // correct tab either way.
-async function saveAndResetFeed(tabs, activeTabId) {
+async function saveAndResetFeed(tabs, activeTabId, debug) {
     await save(tabs, activeTabId);
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-    const {debug} = await loadState();
+    // Start loading the new active tab's seen lists before the feed refetches,
+    // so the first scf:seen-query doesn't wait on storage.
+    warmSeenLists(activeTab);
+    // Before applyConfig: the reset's scf:stats carries the new tab's id.
+    setInfoTab(activeTab);
     applyConfig(activeTab, debug, "reset-feed");
 }
+
+// ── Impure: seen storage ──────────────────────────────────────────────────────
+// Lists ("tab:<id>" or "all") are stored as month buckets scfSeen:<listId>:<YYYY-MM>, sized in scfSeenIndex.
+
+const SEEN_INDEX_KEY = "scfSeenIndex";
+const SEEN_FLUSH_DELAY_MS = 2000;
+// Stays under storage.local's 10 MB quota without needing unlimitedStorage.
+const SEEN_MAX_BYTES = 8 * 1024 * 1024;
+const SEEN_BYTES_PER_ID = 11;
+
+// listId → Promise<Set<number>>. Loaded lazily; the promise is the "ready"
+// gate that seen queries wait on.
+const seenSets = new Map();
+// listId → Set<number>, filled once the list's load finished. recordSeen adds
+// to these synchronously, so the next query already sees fresh ids.
+const seenLoaded = new Map();
+// listId → Set<number> of ids recorded but not yet written to storage.
+let seenPending = new Map();
+let seenFlushTimer = null;
+// Loads and flushes run one at a time, so a load never reads storage halfway
+// through a flush (which could drop ids that are neither pending nor stored).
+let seenQueue = Promise.resolve();
+
+function enqueueSeenOp(fn) {
+    const run = seenQueue.then(fn);
+    seenQueue = run.catch(() => {});
+    return run;
+}
+
+function seenListIdFor(tabId, source) {
+    return source === "all" ? "all" : `tab:${tabId}`;
+}
+
+function seenBucketKey(listId, month) {
+    return `scfSeen:${listId}:${month}`;
+}
+
+function seenMonth(monthsAgo = 0) {
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth() - monthsAgo, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// Returns a plain {listId: {month: count}} object from untrusted stored data.
+function sanitizeSeenIndex(raw) {
+    const index = {};
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return index;
+    for (const [listId, months] of Object.entries(raw)) {
+        if (months === null || typeof months !== "object" || Array.isArray(months)) continue;
+        const clean = {};
+        for (const [month, count] of Object.entries(months)) {
+            if (/^\d{4}-\d{2}$/.test(month) && Number.isInteger(count) && count >= 0) clean[month] = count;
+        }
+        index[listId] = clean;
+    }
+    return index;
+}
+
+async function loadSeenSet(listId) {
+    const set = new Set();
+    try {
+        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+        const months = Object.keys(sanitizeSeenIndex(stored[SEEN_INDEX_KEY])[listId] ?? {});
+        if (months.length > 0) {
+            const keys = months.map((m) => seenBucketKey(listId, m));
+            const buckets = await browser.storage.local.get(keys);
+            for (const key of keys) {
+                if (!Array.isArray(buckets[key])) continue;
+                for (const id of buckets[key]) set.add(id);
+            }
+        }
+    } catch (e) {
+        console.error(`[SCF] failed to load seen list ${listId}:`, e);
+    }
+    // Ids recorded while the list was loading: keep them in memory, but drop
+    // the ones storage already has so they stay in their first-seen month.
+    const pending = seenPending.get(listId);
+    if (pending) {
+        for (const id of [...pending]) {
+            if (set.has(id)) pending.delete(id);
+            else set.add(id);
+        }
+    }
+    seenLoaded.set(listId, set);
+    return set;
+}
+
+// Returns the list's Set, loading it from storage on first use. Never rejects:
+// a failed load yields an empty Set.
+function getSeenSet(listId) {
+    let ready = seenSets.get(listId);
+    if (!ready) {
+        ready = enqueueSeenOp(() => loadSeenSet(listId));
+        seenSets.set(listId, ready);
+    }
+    return ready;
+}
+
+// Starts loading the lists a tab records into, if it records at all.
+function warmSeenLists(tab) {
+    if (tab?.type !== "settings" || tab.settings.alreadySeen.mode === "off") return;
+    getSeenSet(seenListIdFor(tab.id, "tab"));
+    getSeenSet("all");
+}
+
+// Records ids a tab showed into its own list and the shared list. The
+// in-memory Sets update immediately; storage is written by a debounced flush.
+function recordSeen(tabId, ids) {
+    let added = false;
+    for (const listId of [seenListIdFor(tabId, "tab"), "all"]) {
+        getSeenSet(listId); // make sure the list loads before the flush runs
+        const set = seenLoaded.get(listId); // undefined while still loading
+        let pending = seenPending.get(listId);
+        for (const id of ids) {
+            if (set?.has(id) || pending?.has(id)) continue;
+            set?.add(id);
+            if (!pending) {
+                pending = new Set();
+                seenPending.set(listId, pending);
+            }
+            pending.add(id);
+            added = true;
+        }
+    }
+    if (added) {
+        scheduleSeenFlush();
+        refreshInfoCounts();
+    }
+}
+
+function scheduleSeenFlush() {
+    if (seenFlushTimer !== null) return;
+    seenFlushTimer = setTimeout(() => {
+        seenFlushTimer = null;
+        enqueueSeenOp(flushSeen).catch(console.error);
+    }, SEEN_FLUSH_DELAY_MS);
+}
+
+// Writes pending ids into the current month's buckets and updates the index.
+// Read-merge-write, so two SoundCloud windows don't overwrite each other.
+async function flushSeen() {
+    if (seenPending.size === 0) return;
+    const batch = seenPending;
+    seenPending = new Map();
+    const month = seenMonth();
+    try {
+        const keys = [...batch.keys()].map((listId) => seenBucketKey(listId, month));
+        const stored = await browser.storage.local.get([SEEN_INDEX_KEY, ...keys]);
+        const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+        const updates = {};
+        for (const [listId, ids] of batch) {
+            const key = seenBucketKey(listId, month);
+            const bucket = Array.isArray(stored[key]) ? stored[key] : [];
+            const inBucket = new Set(bucket);
+            for (const id of ids) {
+                if (!inBucket.has(id)) {
+                    bucket.push(id);
+                    inBucket.add(id);
+                }
+            }
+            updates[key] = bucket;
+            index[listId] = {...(index[listId] ?? {}), [month]: bucket.length};
+        }
+        updates[SEEN_INDEX_KEY] = index;
+        await browser.storage.local.set(updates);
+    } catch (e) {
+        console.error("[SCF] failed to save seen tracks:", e);
+        // Keep the ids for the next flush.
+        for (const [listId, ids] of batch) {
+            const pending = seenPending.get(listId) ?? new Set();
+            for (const id of ids) pending.add(id);
+            seenPending.set(listId, pending);
+        }
+    }
+}
+
+// Flushes immediately (best effort) when the page goes away, so a refresh
+// right after scrolling doesn't lose the last debounce window.
+function flushSeenNow() {
+    if (seenFlushTimer !== null) {
+        clearTimeout(seenFlushTimer);
+        seenFlushTimer = null;
+    }
+    if (seenPending.size > 0) enqueueSeenOp(flushSeen).catch(console.error);
+}
+
+// Queued so an in-flight flush is either fully counted (index) or still pending.
+function seenCount(listId) {
+    return enqueueSeenOp(async () => {
+        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+        const months = sanitizeSeenIndex(stored[SEEN_INDEX_KEY])[listId] ?? {};
+        const flushed = Object.values(months).reduce((sum, n) => sum + n, 0);
+        return flushed + (seenPending.get(listId)?.size ?? 0);
+    }).catch((e) => {
+        console.error(`[SCF] failed to count seen list ${listId}:`, e);
+        return 0;
+    });
+}
+
+// Removes the given lists from storage and memory; null removes every list.
+function clearSeen(listIds) {
+    return enqueueSeenOp(async () => {
+        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+        const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+        const targets = listIds ?? [...new Set([...Object.keys(index), ...seenSets.keys(), ...seenPending.keys()])];
+        const keys = [];
+        for (const listId of targets) {
+            for (const month of Object.keys(index[listId] ?? {})) keys.push(seenBucketKey(listId, month));
+            delete index[listId];
+            seenSets.delete(listId);
+            seenLoaded.delete(listId);
+            seenPending.delete(listId);
+        }
+        if (listIds === null) {
+            await browser.storage.local.remove([...keys, SEEN_INDEX_KEY]);
+        } else {
+            await browser.storage.local.remove(keys);
+            await browser.storage.local.set({[SEEN_INDEX_KEY]: index});
+        }
+    }).catch((e) => console.error("[SCF] failed to clear seen tracks:", e))
+        .finally(() => { refreshInfoCounts(); });
+}
+
+// Keeps the current month plus the last `retentionMonths`, so a track stays
+// hidden for N to N+1 months. Then drops the oldest buckets of any list
+// until the estimated size fits SEEN_MAX_BYTES.
+function pruneSeen(retentionMonths) {
+    return enqueueSeenOp(async () => {
+        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+        const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+        const oldestKept = seenMonth(retentionMonths);
+        const buckets = [];
+        for (const [listId, months] of Object.entries(index)) {
+            for (const [month, count] of Object.entries(months)) buckets.push({listId, month, count});
+        }
+        buckets.sort((a, b) => a.month.localeCompare(b.month));
+        let bytes = buckets.reduce((sum, b) => sum + b.count * SEEN_BYTES_PER_ID, 0);
+        const dropped = buckets.filter((b) => {
+            if (b.month >= oldestKept && bytes <= SEEN_MAX_BYTES) return false;
+            bytes -= b.count * SEEN_BYTES_PER_ID;
+            return true;
+        });
+        if (dropped.length === 0) return;
+        for (const {listId, month} of dropped) {
+            delete index[listId][month];
+            if (Object.keys(index[listId]).length === 0) delete index[listId];
+            // Reloaded on next use; pending ids are merged back in by loadSeenSet.
+            seenSets.delete(listId);
+            seenLoaded.delete(listId);
+        }
+        await browser.storage.local.remove(dropped.map((b) => seenBucketKey(b.listId, b.month)));
+        await browser.storage.local.set({[SEEN_INDEX_KEY]: index});
+    }).catch((e) => console.error("[SCF] failed to prune seen tracks:", e))
+        .finally(() => { refreshInfoCounts(); });
+}
+
+// Estimated from the index so no ids have to be loaded.
+function seenBytes() {
+    return enqueueSeenOp(async () => {
+        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+        let ids = 0;
+        for (const months of Object.values(sanitizeSeenIndex(stored[SEEN_INDEX_KEY]))) {
+            for (const count of Object.values(months)) ids += count;
+        }
+        for (const pending of seenPending.values()) ids += pending.size;
+        return ids * SEEN_BYTES_PER_ID;
+    }).catch((e) => {
+        console.error("[SCF] failed to measure seen tracks:", e);
+        return 0;
+    });
+}
+
+// Clears a list and rebuilds the feed only if the active tab currently hides against it.
+async function resetSeenList(listId, tabs, activeTabId) {
+    await clearSeen([listId]);
+    const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+    if (activeTab.type !== "settings") return;
+    const {mode, source} = activeTab.settings.alreadySeen;
+    if (mode === "on" && seenListIdFor(activeTab.id, source) === listId) {
+        const {debug} = await loadState();
+        await saveAndResetFeed(tabs, activeTabId, debug);
+    }
+}
+
+// Seen channel with filter.js. Registered once per page; details are JSON
+// strings (Firefox-safe, see applyConfig). Page scripts can dispatch these
+// events too, so every payload is validated.
+document.addEventListener("scf:seen-query", (event) => {
+    let query;
+    try {
+        query = JSON.parse(event.detail);
+    } catch (_e) {
+        return;
+    }
+    if (!query || typeof query.tabId !== "string" || !Array.isArray(query.ids)) return;
+    getSeenSet(seenListIdFor(query.tabId, query.source)).then((set) => {
+        const seen = query.ids.filter((id) => set.has(id));
+        document.dispatchEvent(new CustomEvent("scf:seen-result", {
+            detail: JSON.stringify({reqId: query.reqId, seen}),
+        }));
+    });
+});
+
+document.addEventListener("scf:seen", (event) => {
+    let report;
+    try {
+        report = JSON.parse(event.detail);
+    } catch (_e) {
+        return;
+    }
+    if (!report || typeof report.tabId !== "string" || !Array.isArray(report.ids)) return;
+    const ids = report.ids.filter((id) => Number.isInteger(id));
+    if (ids.length > 0) recordSeen(report.tabId, ids);
+});
+
+window.addEventListener("pagehide", flushSeenNow);
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushSeenNow();
+});
+
+// ── Impure: tab bar info section ──────────────────────────────────────────────
+
+let infoTab = null; // the active tab the info section describes
+let infoCounts = {tab: 0, all: 0};
+let infoStats = null; // last scf:stats of infoTab, null until its feed reports
+
+function setInfoTab(tab) {
+    if (infoTab?.id !== tab.id) infoStats = null;
+    infoTab = tab;
+    refreshInfoCounts();
+    renderInfo();
+}
+
+async function refreshInfoCounts() {
+    const tab = infoTab;
+    if (!tab) return;
+    const [tabCount, allCount] = await Promise.all([
+        seenCount(seenListIdFor(tab.id, "tab")),
+        seenCount("all"),
+    ]);
+    // A newer refresh for the new tab is already on its way.
+    if (infoTab?.id !== tab.id) return;
+    infoCounts = {tab: tabCount, all: allCount};
+    renderInfo();
+}
+
+// Queries the live bar each time: initFilters can swap in a new one at any point.
+function renderInfo() {
+    const item = document.querySelector("#scf-tab-bar .scf-info-item");
+    if (!item || !infoTab) return;
+    const {mode, source} = infoTab.type === "settings"
+        ? infoTab.settings.alreadySeen
+        : {mode: "off", source: "tab"};
+    const off = mode === "off";
+    item.querySelector(".scf-info-seen-label").textContent =
+        off ? "Seen: off" : mode === "paused" ? "Seen (paused):" : "Seen:";
+    for (const el of item.querySelectorAll(".scf-info-seen")) {
+        const count = formatCount(infoCounts[el.dataset.source]);
+        el.textContent = `${count} ${el.dataset.source === "all" ? "all tabs" : "this tab"}`;
+        el.classList.toggle("scf-info-muted", el.dataset.source !== source);
+        el.hidden = off;
+    }
+    item.querySelector(".scf-info-seen-sep").hidden = off;
+    const {filtered, scanned} = infoStats ?? {filtered: 0, scanned: 0};
+    item.querySelector(".scf-info-filtered").textContent =
+        `Filtered: ${formatCount(filtered)} of ${formatCount(scanned)}`;
+}
+
+document.addEventListener("scf:stats", (event) => {
+    let stats;
+    try {
+        stats = JSON.parse(event.detail);
+    } catch (_e) {
+        return;
+    }
+    if (!stats || typeof stats.tabId !== "string" || stats.tabId !== infoTab?.id) return;
+    if (!Number.isInteger(stats.filtered) || !Number.isInteger(stats.scanned)) return;
+    infoStats = {filtered: stats.filtered, scanned: stats.scanned};
+    renderInfo();
+});
 
 // ── Impure: script injection ──────────────────────────────────────────────────
 
@@ -287,557 +717,6 @@ function injectFilterScripts(tabConfig, debug) {
 }
 
 // ── Pure: DOM builders ────────────────────────────────────────────────────────
-
-function injectStyles() {
-    if (document.getElementById("scf-styles")) return;
-    const style = document.createElement("style");
-    style.id = "scf-styles";
-    style.textContent = `
-    body.theme-dark {
-      --scf-bg: #1a1a1a;
-      --scf-bg-input: #2a2a2a;
-      --scf-bg-hover: #333333;
-      --scf-border: #333333;
-      --scf-border-row: #222222;
-      --scf-border-ctrl: #444444;
-      --scf-text: #e0e0e0;
-      --scf-text-2: #bbbbbb;
-      --scf-text-muted: #888888;
-      --scf-text-dim: #666666;
-    }
-    body.theme-light {
-      --scf-bg: #ffffff;
-      --scf-bg-input: #f5f5f5;
-      --scf-bg-hover: #e8e8e8;
-      --scf-border: #dddddd;
-      --scf-border-row: #ebebeb;
-      --scf-border-ctrl: #d0d0d0;
-      --scf-text: #222222;
-      --scf-text-2: #444444;
-      --scf-text-muted: #767676;
-      --scf-text-dim: #999999;
-    }
-    /* ── Tab bar additions ─────────────────────────── */
-    #scf-stream-header {
-      overflow: visible;
-      height: auto;
-      min-height: 0;
-      position: sticky;
-      top: var(--header-height, 46px);
-      z-index: 100;
-      background: var(--background-surface-color, var(--scf-bg));
-    }
-    #scf-tab-bar {
-      display: flex;
-      flex-wrap: wrap;
-      flex-direction: row;
-      white-space: normal;
-      overflow: visible;
-      justify-content: flex-start;
-      align-items: center;
-      height: auto;
-      min-height: 0;
-    }
-    #scf-tab-bar .g-tabs-item[data-tab-id],
-    #scf-tab-bar .scf-global-gear-item,
-    #scf-tab-bar .scf-add-item {
-      display: inline-flex;
-      align-items: center;
-      white-space: nowrap;
-      margin: 0 2px 0 2px;
-    }
-    #scf-tab-bar .g-tabs-item[data-tab-id] .g-tabs-link {
-      position: relative;
-      text-align: center;
-      padding-left: 10px;
-      padding-right: 10px;
-    }
-    .scf-gear-btn {
-      position: absolute;
-      right: -4px;
-      top: 50%;
-      transform: translateY(-50%);
-      background: none;
-      border: none;
-      cursor: pointer;
-      color: var(--scf-text-muted);
-      padding: 0;
-      line-height: 0;
-      display: inline-flex;
-      align-items: center;
-      opacity: 0;
-      transition: opacity 0.15s;
-    }
-    /* Show gear when the tab item is hovered */
-    .g-tabs-item[data-tab-id]:hover .scf-gear-btn {
-      opacity: 0.7;
-    }
-    .g-tabs-item[data-tab-id]:hover .scf-gear-btn:hover {
-      opacity: 1;
-      color: var(--scf-text-2);
-    }
-    /* global gear and add links — use g-tabs-link for automatic height alignment */
-    #scf-tab-bar .scf-global-gear-link,
-    #scf-tab-bar .scf-add-link {
-      display: inline-flex;
-      align-items: center;
-      color: var(--scf-text-muted);
-      opacity: 0.8;
-    }
-    #scf-tab-bar .scf-global-gear-link:hover { opacity: 1; color: var(--scf-text-2); }
-    #scf-tab-bar .scf-add-link {
-      font-size: 16px;
-      line-height: 1;
-      padding-left: 6px;
-    }
-    #scf-tab-bar .scf-add-link:hover { color: #ff5500; opacity: 1; }
-
-    /* ── Settings panel ────────────────────────────── */
-    #scf-settings-panel, #scf-global-panel {
-      position: fixed;
-      top: 60px;
-      right: 16px;
-      z-index: 9999;
-      background: var(--scf-bg);
-      color: var(--scf-text);
-      border-radius: 8px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      font-size: 13px;
-      width: 260px;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
-      user-select: none;
-      border: 1px solid var(--scf-border);
-    }
-    #scf-settings-panel .scf-panel-header,
-    #scf-global-panel .scf-panel-header {
-      display: flex;
-      align-items: center;
-      padding: 10px 12px;
-      gap: 8px;
-      border-bottom: 1px solid var(--scf-border);
-    }
-    #scf-settings-panel .scf-name-input {
-      flex: 1;
-      background: var(--scf-bg-input);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 4px;
-      color: var(--scf-text);
-      font-size: 13px;
-      padding: 4px 8px;
-      outline: none;
-    }
-    #scf-settings-panel .scf-name-input:focus {
-      border-color: #ff5500;
-    }
-    #scf-global-panel .scf-panel-title {
-      flex: 1;
-      font-weight: 500;
-      font-size: 13px;
-    }
-    .scf-close-btn {
-      background: none;
-      border: none;
-      color: var(--scf-text-muted);
-      cursor: pointer;
-      font-size: 16px;
-      line-height: 1;
-      padding: 0;
-    }
-    .scf-close-btn:hover { color: var(--scf-text); }
-
-    #scf-settings-panel .scf-body {
-      max-height: 60vh;
-      overflow-y: auto;
-    }
-    .scf-section-header {
-      padding: 6px 12px 4px;
-      font-size: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--scf-text-dim);
-      border-bottom: 1px solid var(--scf-border-row);
-    }
-    .scf-row {
-      display: flex;
-      align-items: center;
-      padding: 10px 12px;
-      gap: 8px;
-      border-bottom: 1px solid var(--scf-border-row);
-    }
-    .scf-row-label {
-      flex: 1;
-      font-size: 12px;
-      color: var(--scf-text-2);
-      line-height: 1.3;
-    }
-    .scf-help {
-      display: inline-block;
-      width: 14px;
-      height: 14px;
-      line-height: 14px;
-      text-align: center;
-      font-size: 10px;
-      font-weight: 600;
-      color: var(--scf-text-dim);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 50%;
-      cursor: default;
-      position: relative;
-      margin-left: 4px;
-      flex-shrink: 0;
-      vertical-align: middle;
-    }
-    #scf-tooltip {
-      position: fixed;
-      background: var(--scf-bg-input);
-      color: var(--scf-text);
-      font-size: 11px;
-      font-weight: 400;
-      line-height: 1.4;
-      padding: 6px 8px;
-      border-radius: 4px;
-      border: 1px solid var(--scf-border-ctrl);
-      width: 180px;
-      white-space: normal;
-      z-index: 99999;
-      pointer-events: none;
-      display: none;
-    }
-    .scf-toggle {
-      position: relative;
-      width: 32px;
-      height: 18px;
-      flex-shrink: 0;
-      cursor: pointer;
-    }
-    .scf-toggle input {
-      opacity: 0;
-      width: 0;
-      height: 0;
-      position: absolute;
-    }
-    .scf-toggle-track {
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: var(--scf-border-ctrl);
-      border-radius: 9px;
-      transition: background 0.2s;
-    }
-    .scf-toggle input:checked + .scf-toggle-track { background: #ff5500; }
-    .scf-toggle-track::after {
-      content: '';
-      position: absolute;
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      background: #fff;
-      top: 2px;
-      left: 2px;
-      transition: transform 0.2s;
-    }
-    .scf-toggle input:checked + .scf-toggle-track::after { transform: translateX(14px); }
-    .scf-row-disabled {
-      opacity: 0.4;
-      pointer-events: none;
-    }
-    .scf-row-disabled .scf-help {
-      pointer-events: auto;
-    }
-    #scf-pf-nit-row {
-      border-bottom: none;
-    }
-
-    /* Segmented control for filterReposts.type */
-    .scf-sub-section {
-      display: none;
-      padding: 6px 12px 10px;
-      border-bottom: 1px solid var(--scf-border-row);
-    }
-    .scf-sub-section.scf-visible { display: block; }
-    .scf-filter-info {
-      margin: 8px 0 0;
-      font-size: 11px;
-      color: var(--scf-text-muted);
-      line-height: 1.5;
-    }
-    .scf-segmented {
-      display: flex;
-      gap: 4px;
-    }
-    .scf-seg-btn {
-      flex: 1;
-      padding: 4px 0;
-      font-size: 11px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 3px;
-      cursor: pointer;
-    }
-    .scf-seg-btn.scf-active {
-      background: #ff5500;
-      color: #fff;
-      border-color: #ff5500;
-    }
-    .scf-pf-mode-btn {
-      flex: 1;
-      padding: 4px 0;
-      font-size: 11px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 3px;
-      cursor: pointer;
-    }
-    .scf-pf-mode-btn.scf-active {
-      background: #ff5500;
-      color: #fff;
-      border-color: #ff5500;
-    }
-
-    /* Sliders */
-    .scf-slider-section {
-      display: none;
-      padding: 8px 12px 12px;
-      border-bottom: 1px solid var(--scf-border-row);
-    }
-    .scf-slider-section.scf-visible { display: block; }
-    .scf-slider-labels {
-      display: flex;
-      justify-content: space-between;
-      font-size: 11px;
-      color: var(--scf-text-muted);
-      margin-bottom: 6px;
-    }
-    .scf-slider-wrap, .scf-single-wrap {
-      position: relative;
-      height: 24px;
-      display: flex;
-      align-items: center;
-    }
-    .scf-slider-base {
-      position: absolute;
-      left: 0; right: 0;
-      height: 4px;
-      background: var(--scf-border-ctrl);
-      border-radius: 2px;
-      pointer-events: none;
-    }
-    .scf-slider-fill {
-      position: absolute;
-      height: 4px;
-      background: #ff5500;
-      border-radius: 2px;
-      pointer-events: none;
-    }
-    .scf-slider-wrap input[type=range],
-    .scf-single-wrap input[type=range] {
-      position: absolute;
-      width: 100%;
-      -webkit-appearance: none;
-      -moz-appearance: none;
-      background: transparent;
-      pointer-events: none;
-      margin: 0; padding: 0;
-      height: 4px;
-    }
-    .scf-slider-wrap input[type=range]::-webkit-slider-runnable-track,
-    .scf-single-wrap input[type=range]::-webkit-slider-runnable-track {
-      background: transparent; height: 4px;
-    }
-    .scf-slider-wrap input[type=range]::-webkit-slider-thumb,
-    .scf-single-wrap input[type=range]::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      pointer-events: all;
-      width: 14px; height: 14px;
-      border-radius: 50%;
-      background: #ff5500;
-      border: 2px solid var(--scf-bg);
-      cursor: pointer;
-      margin-top: -5px;
-    }
-    .scf-slider-wrap input[type=range]::-moz-range-thumb,
-    .scf-single-wrap input[type=range]::-moz-range-thumb {
-      -moz-appearance: none;
-      pointer-events: all;
-      width: 14px; height: 14px;
-      border-radius: 50%;
-      background: #ff5500;
-      border: 2px solid var(--scf-bg);
-      cursor: pointer;
-    }
-    .scf-warning {
-      display: none;
-      font-size: 11px;
-      color: #f5a623;
-      margin: 6px 0 0;
-      line-height: 1.4;
-    }
-    .scf-warning:not([hidden]) { display: block; }
-
-    /* Tag filter */
-    .scf-tag-section {
-      display: none;
-      padding: 8px 12px 12px;
-      border-bottom: 1px solid var(--scf-border-row);
-    }
-    .scf-tag-section.scf-visible { display: block; }
-    .scf-tag-mode-row { display: flex; gap: 4px; margin-bottom: 8px; }
-    .scf-tag-mode-btn {
-      flex: 1;
-      padding: 4px 0;
-      font-size: 11px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 3px;
-      cursor: pointer;
-    }
-    .scf-tag-mode-btn.scf-active { background: #ff5500; color: #fff; border-color: #ff5500; }
-    .scf-tag-input-row { display: flex; gap: 4px; margin-bottom: 8px; }
-    .scf-tag-input {
-      flex: 1;
-      padding: 3px 6px;
-      font-size: 11px;
-      background: var(--scf-bg-input);
-      color: var(--scf-text);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 3px;
-      outline: none;
-    }
-    .scf-tag-add-btn, .scf-tag-clear-btn {
-      padding: 3px 8px;
-      font-size: 11px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 3px;
-      cursor: pointer;
-    }
-    .scf-tag-add-btn:hover, .scf-tag-clear-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
-    .scf-tag-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
-    .scf-tag-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 3px;
-      padding: 2px 6px;
-      font-size: 11px;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 10px;
-    }
-    .scf-tag-chip-remove {
-      background: none; border: none; color: var(--scf-text-muted);
-      cursor: pointer; font-size: 12px; line-height: 1; padding: 0;
-    }
-    .scf-tag-chip-remove:hover { color: var(--scf-text); }
-
-    /* Panel footer */
-    .scf-panel-footer {
-      display: flex;
-      justify-content: flex-end;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 12px;
-      border-top: 1px solid var(--scf-border);
-    }
-    .scf-panel-footer .scf-delete-btn {
-      margin-right: auto;
-      background: none;
-      border: none;
-      color: var(--scf-text-muted);
-      font-size: 12px;
-      cursor: pointer;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    }
-    .scf-panel-footer .scf-delete-btn:hover { color: #e04040; }
-    .scf-btn {
-      padding: 5px 14px;
-      font-size: 12px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      border-radius: 4px;
-      cursor: pointer;
-      border: 1px solid var(--scf-border-ctrl);
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-    }
-    .scf-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
-    .scf-btn-primary {
-      background: #ff5500;
-      border-color: #ff5500;
-      color: #fff;
-    }
-    .scf-btn-primary:hover { background: #e04d00; }
-
-    /* Global panel body */
-    #scf-global-panel .scf-body { padding: 12px; }
-    #scf-global-panel .scf-restore-btn {
-      width: 100%;
-      padding: 8px;
-      font-size: 13px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    #scf-global-panel .scf-restore-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
-    #scf-global-panel .scf-global-links {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-bottom: 12px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--scf-border);
-    }
-    /* Help link — matches the restore button above it */
-    #scf-global-panel .scf-help-btn {
-      display: block;
-      width: 100%;
-      box-sizing: border-box;
-      padding: 8px;
-      font-size: 13px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      text-align: center;
-      text-decoration: none;
-      background: var(--scf-bg-input);
-      color: var(--scf-text-2);
-      border: 1px solid var(--scf-border-ctrl);
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    #scf-global-panel .scf-help-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
-    /* Buy Me a Coffee brand banner */
-    #scf-global-panel .scf-coffee-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      width: 100%;
-      box-sizing: border-box;
-      padding: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #ffdd00;
-      color: #000000;
-      border: 1px solid #ffdd00;
-      border-radius: 4px;
-      cursor: pointer;
-      text-decoration: none;
-    }
-    #scf-global-panel .scf-coffee-btn:hover { background: #ffe74d; border-color: #ffe74d; }
-    #scf-global-panel .scf-coffee-btn svg { display: block; }
-  `;
-    document.head.appendChild(style);
-}
 
 // ── Tooltip helpers ───────────────────────────────────────────────────────────
 
@@ -876,7 +755,7 @@ function attachTooltipListeners(el) {
 }
 
 // Returns the full <ul> tab bar element. No event listeners attached.
-function buildTabBar(tabs, activeId) {
+function buildTabBar(tabs, activeId, {infoOpen}) {
     const ul = document.createElement("ul");
     ul.className = "collectionNav g-tabs";
     ul.id = "scf-tab-bar";
@@ -928,7 +807,27 @@ function buildTabBar(tabs, activeId) {
     addLi.appendChild(addLink);
     ul.appendChild(addLi);
 
+    // Numbers are filled in by renderInfo().
+    const infoLi = document.createElement("li");
+    infoLi.className = "g-tabs-item scf-info-item";
+    infoLi.innerHTML = `<a class="g-tabs-link scf-info-link" href="#"><svg width="13" height="13" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1Zm0 1.5a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11ZM7.25 7h1.5v4.5h-1.5V7ZM8 4.1a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z"/></svg></a>
+      <span class="scf-info-body">
+        <span class="scf-info-seen-label"></span>
+        <span class="scf-info-seen" data-source="all"></span>
+        <span class="scf-info-sep scf-info-seen-sep">·</span>
+        <span class="scf-info-seen" data-source="tab"></span>
+        <span class="scf-info-sep">|</span>
+        <span class="scf-info-filtered" title="Items hidden by this tab since the feed was last loaded"></span>
+      </span>`;
+    setInfoOpen(infoLi, infoOpen);
+    ul.appendChild(infoLi);
+
     return ul;
+}
+
+function setInfoOpen(infoLi, open) {
+    infoLi.classList.toggle("scf-info-open", open);
+    infoLi.querySelector(".scf-info-link").title = open ? "Hide tab stats" : "Show tab stats";
 }
 
 const REPOST_INFO = {
@@ -942,14 +841,20 @@ const PLAYLIST_INFO = {
     hideAll: "All playlists are hidden from your feed.",
 };
 
-function buildSettingsPanel(tab) {
+function seenCountLine(source, label, count, activeSource) {
+    return `<div class="scf-seen-count${source === activeSource ? "" : " scf-seen-count-muted"}" data-source="${source}" data-count="${count}">
+          ${label}: <span class="scf-seen-num">${formatCount(count)}</span> seen<span class="scf-seen-reset-wrap"${count === 0 ? " hidden" : ""}> · <button class="scf-seen-reset">Reset</button></span>
+        </div>`;
+}
+
+function buildSettingsPanel(tab, {counts, retention}) {
     const s = tab.type === "settings" ? tab.settings : sanitizeSettings({});
     const panel = document.createElement("div");
     panel.id = "scf-settings-panel";
 
     panel.innerHTML = `
     <div class="scf-panel-header">
-      <input class="scf-name-input" type="text" value="${tab.name.replace(/"/g, '&quot;')}" placeholder="Filter name">
+      <input class="scf-name-input" type="text" placeholder="Filter name">
       <button class="scf-close-btn" title="Close">×</button>
     </div>
     <div class="scf-body">
@@ -1057,11 +962,23 @@ function buildSettingsPanel(tab) {
         </label>
       </div>
       <div class="scf-row">
-        <span class="scf-row-label">Hide seen tracks <span class="scf-help" data-tip="Hide tracks you've already scrolled past this session.">?</span></span>
-        <label class="scf-toggle">
-          <input type="checkbox" id="scf-as-toggle"${s.alreadySeen.enabled ? " checked" : ""}>
-          <span class="scf-toggle-track"></span>
-        </label>
+        <span class="scf-row-label">Hide seen tracks <span class="scf-help" data-tip="Hides tracks you've already seen, for ${SEEN_RETENTION_LABELS[retention]}. Paused keeps recording without hiding.">?</span></span>
+        <div class="scf-segmented" id="scf-as-mode">
+          <button class="scf-seg-btn${s.alreadySeen.mode === "on" ? " scf-active" : ""}" data-mode="on">On</button>
+          <button class="scf-seg-btn${s.alreadySeen.mode === "paused" ? " scf-active" : ""}" data-mode="paused">Paused</button>
+          <button class="scf-seg-btn${s.alreadySeen.mode === "off" ? " scf-active" : ""}" data-mode="off">Off</button>
+        </div>
+      </div>
+      <div class="scf-sub-section${s.alreadySeen.mode !== "off" ? " scf-visible" : ""}" id="scf-as-sub">
+        <div class="scf-row" id="scf-as-source-row">
+          <span class="scf-row-label">Hide tracks seen in</span>
+          <div class="scf-segmented" id="scf-as-source">
+            <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">This tab</button>
+            <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">All tabs</button>
+          </div>
+        </div>
+        ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
+        ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
       </div>
     </div>
     <div class="scf-panel-footer">
@@ -1071,10 +988,16 @@ function buildSettingsPanel(tab) {
     </div>
   `;
 
+    panel.querySelector(".scf-name-input").value = tab.name;
+
     return panel;
 }
 
-function buildGlobalPanel(debug) {
+function buildGlobalPanel(debug, {retention, seenBytes}) {
+    const retentionButtons = Object.keys(SEEN_RETENTION_LABELS).map((m) => {
+        const label = m === "12" ? "1 yr" : `${m} mo`;
+        return `<button class="scf-seg-btn${Number(m) === retention ? " scf-active" : ""}" data-months="${m}">${label}</button>`;
+    }).join("");
     const panel = document.createElement("div");
     panel.id = "scf-global-panel";
     panel.innerHTML = `
@@ -1091,6 +1014,15 @@ function buildGlobalPanel(debug) {
         <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
       </div>
       <button class="scf-restore-btn" id="scf-restore-btn">Restore default tabs</button>
+      <div class="scf-row" id="scf-seen-retention-row">
+        <span class="scf-row-label">Remember seen tracks for <span class="scf-help" data-tip="Seen tracks older than this show up again. Applies to every tab.">?</span></span>
+      </div>
+      <div class="scf-global-seen">
+        <div class="scf-segmented" id="scf-seen-retention">${retentionButtons}</div>
+        <div class="scf-seen-count" id="scf-seen-data">
+          Seen data: <span class="scf-seen-num">${formatBytes(seenBytes)}</span><span class="scf-seen-reset-wrap"${seenBytes === 0 ? " hidden" : ""}> · <button class="scf-seen-reset" id="scf-clear-seen-btn">Clear all seen tracks</button></span>
+        </div>
+      </div>
       <div class="scf-row">
         <span class="scf-row-label">Debug logging <span class="scf-help" data-tip="Logs each feed item and why it was shown or filtered to the browser console (DevTools → Console).">?</span></span>
         <label class="scf-toggle">
@@ -1106,7 +1038,7 @@ function buildGlobalPanel(debug) {
 // ── Impure: tab bar listeners ─────────────────────────────────────────────────
 
 function attachTabBarListeners(el, handlers) {
-    const {onTabClick, onGearClick, onGlobalGearClick, onPlusClick} = handlers;
+    const {onTabClick, onGearClick, onGlobalGearClick, onPlusClick, onInfoToggle} = handlers;
 
     el.querySelector(".scf-global-gear-link").addEventListener("click", (e) => {
         e.preventDefault();
@@ -1135,50 +1067,46 @@ function attachTabBarListeners(el, handlers) {
         e.preventDefault();
         onPlusClick();
     });
+
+    const infoLi = el.querySelector(".scf-info-item");
+    infoLi.querySelector(".scf-info-link").addEventListener("click", (e) => {
+        e.preventDefault();
+        const open = !infoLi.classList.contains("scf-info-open");
+        setInfoOpen(infoLi, open);
+        onInfoToggle(open);
+    });
 }
 
 // ── Impure: panels ────────────────────────────────────────────────────────────
 
-// Reads current values out of the panel DOM and returns an updated TabConfig.
-function readPanelState(el, tab) {
-    const settings = tab.type === "settings"
-        ? JSON.parse(JSON.stringify(tab.settings))
-        : sanitizeSettings({});
+function dualSlider(el, prefix, maxFloor, renderLabel) {
+    const minEl = el.querySelector(`#scf-${prefix}-min`);
+    const maxEl = el.querySelector(`#scf-${prefix}-max`);
+    const fill = el.querySelector(`#scf-${prefix}-fill`);
+    const range = Number(maxEl.max);
 
-    settings.filterReposts.enabled = el.querySelector("#scf-fr-toggle").checked;
-    const activeSegBtn = el.querySelector(".scf-seg-btn.scf-active");
-    if (activeSegBtn) settings.filterReposts.type = activeSegBtn.dataset.type;
+    function update() {
+        const mn = parseInt(minEl.value, 10);
+        const mx = parseInt(maxEl.value, 10);
+        fill.style.left = (mn / range * 100) + "%";
+        fill.style.right = ((range - mx) / range * 100) + "%";
+        renderLabel(mn, mx);
+    }
 
-    settings.trackLengthInMin.enabled = el.querySelector("#scf-tl-toggle").checked;
-    settings.trackLengthInMin.min = parseInt(el.querySelector("#scf-tl-min").value, 10);
-    settings.trackLengthInMin.max = parseInt(el.querySelector("#scf-tl-max").value, 10);
+    minEl.addEventListener("input", () => {
+        if (parseInt(minEl.value, 10) > parseInt(maxEl.value, 10)) minEl.value = maxEl.value;
+        update();
+    });
+    maxEl.addEventListener("input", () => {
+        const limit = Math.max(maxFloor, parseInt(minEl.value, 10));
+        if (parseInt(maxEl.value, 10) < limit) maxEl.value = limit;
+        update();
+    });
 
-    settings.contentAgeInDays.enabled = el.querySelector("#scf-ca-toggle").checked;
-    settings.contentAgeInDays.min = uiToStorageMin(parseInt(el.querySelector("#scf-ca-min").value, 10));
-    settings.contentAgeInDays.max = uiToStorageMax(parseInt(el.querySelector("#scf-ca-max").value, 10));
-
-    settings.freeDownloadsOnly.enabled = el.querySelector("#scf-fd-toggle").checked;
-    settings.alreadySeen.enabled = el.querySelector("#scf-as-toggle").checked;
-    settings.playlistFilter.enabled = el.querySelector("#scf-pf-toggle").checked;
-    settings.playlistFilter.mode = el.querySelector(".scf-pf-mode-btn.scf-active")?.dataset.mode ?? "hideLarge";
-    settings.playlistFilter.nameInTitles = el.querySelector("#scf-pf-nit-toggle").checked;
-
-    settings.tagFilter.enabled = el.querySelector("#scf-tf-toggle").checked;
-    settings.tagFilter.mode = el.querySelector("#scf-tf-include").classList.contains("scf-active")
-        ? "include"
-        : "exclude";
-    // Tags are kept in chipContainer.dataset.tags (set by renderChips on every mutation)
-    const rawTags = el.querySelector("#scf-tag-chips").dataset.tags;
-    settings.tagFilter.tags = rawTags ? JSON.parse(rawTags) : [];
-
-    return {
-        ...tab,
-        name: el.querySelector(".scf-name-input").value.trim() || tab.name,
-        settings,
-    };
+    update();
 }
 
-function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
+function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen}) {
     // Close buttons
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
     el.querySelector("#scf-close-footer-btn").addEventListener("click", onClose);
@@ -1193,7 +1121,7 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
 
     // Save button
     el.querySelector("#scf-save-btn").addEventListener("click", () => {
-        const updatedTab = readPanelState(el, tab);
+        const updatedTab = readPanelState();
         onSave(updatedTab).catch(console.error);
     });
 
@@ -1204,15 +1132,54 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
         frSub.classList.toggle("scf-visible", frToggle.checked);
     });
 
-    // Segmented control — mutually exclusive
+    // Segmented controls — mutually exclusive within their own group
+    for (const group of el.querySelectorAll(".scf-segmented")) {
+        const buttons = group.querySelectorAll(".scf-seg-btn");
+        for (const btn of buttons) {
+            btn.addEventListener("click", () => {
+                for (const b of buttons) b.classList.toggle("scf-active", b === btn);
+            });
+        }
+    }
+
     const frInfoEl = el.querySelector("#scf-fr-info");
-    el.querySelectorAll(".scf-seg-btn").forEach((btn) => {
+    for (const btn of el.querySelectorAll("#scf-fr-sub .scf-seg-btn")) {
         btn.addEventListener("click", () => {
-            el.querySelectorAll(".scf-seg-btn").forEach((b) => b.classList.remove("scf-active"));
-            btn.classList.add("scf-active");
             frInfoEl.textContent = REPOST_INFO[btn.dataset.type] ?? "";
         });
-    });
+    }
+
+    const asSub = el.querySelector("#scf-as-sub");
+    for (const btn of el.querySelectorAll("#scf-as-mode .scf-seg-btn")) {
+        btn.addEventListener("click", () => {
+            asSub.classList.toggle("scf-visible", btn.dataset.mode !== "off");
+        });
+    }
+
+    const countLines = el.querySelectorAll(".scf-seen-count");
+    for (const btn of el.querySelectorAll("#scf-as-source .scf-seg-btn")) {
+        btn.addEventListener("click", () => {
+            for (const line of countLines) {
+                line.classList.toggle("scf-seen-count-muted", line.dataset.source !== btn.dataset.source);
+            }
+        });
+    }
+    for (const line of countLines) {
+        const source = line.dataset.source;
+        line.querySelector(".scf-seen-reset").addEventListener("click", () => {
+            const count = Number(line.dataset.count);
+            const noun = count === 1 ? "track" : "tracks";
+            const where = source === "all" ? "all tabs" : "this tab";
+            if (!confirm(`Forget ${formatCount(count)} ${noun} seen in ${where}?`)) return;
+            onResetSeen(seenListIdFor(tab.id, source))
+                .then(() => {
+                    line.dataset.count = "0";
+                    line.querySelector(".scf-seen-num").textContent = formatCount(0);
+                    line.querySelector(".scf-seen-reset-wrap").hidden = true;
+                })
+                .catch(console.error);
+        });
+    }
 
     // Playlist filter toggle shows/hides sub-section
     el.querySelector("#scf-pf-toggle").addEventListener("change", (e) => {
@@ -1238,78 +1205,24 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
     }
 
     // Track length toggle + dual slider
-    const tlToggle = el.querySelector("#scf-tl-toggle");
-    const tlSection = el.querySelector("#scf-tl-section");
-    const tlFill = el.querySelector("#scf-tl-fill");
-    const tlMin = el.querySelector("#scf-tl-min");
-    const tlMax = el.querySelector("#scf-tl-max");
+    el.querySelector("#scf-tl-toggle").addEventListener("change", (e) => {
+        el.querySelector("#scf-tl-section").classList.toggle("scf-visible", e.target.checked);
+    });
     const tlMinLabel = el.querySelector("#scf-tl-min-label");
     const tlMaxLabel = el.querySelector("#scf-tl-max-label");
-
-    function updateTlFill() {
-        const mn = parseInt(tlMin.value, 10);
-        const mx = parseInt(tlMax.value, 10);
-        tlFill.style.left = (mn / 120 * 100) + "%";
-        tlFill.style.right = (100 - mx / 120 * 100) + "%";
-    }
-
-    updateTlFill();
-
-    tlToggle.addEventListener("change", () =>
-        tlSection.classList.toggle("scf-visible", tlToggle.checked)
-    );
-    tlMin.addEventListener("input", () => {
-        if (parseInt(tlMin.value, 10) > parseInt(tlMax.value, 10))
-            tlMin.value = tlMax.value;
-        tlMinLabel.textContent = tlMin.value + " min";
-        updateTlFill();
-    });
-    tlMax.addEventListener("input", () => {
-        if (parseInt(tlMax.value, 10) < parseInt(tlMin.value, 10))
-            tlMax.value = tlMin.value;
-        tlMaxLabel.textContent = tlMax.value + " min";
-        updateTlFill();
+    dualSlider(el, "tl", 0, (mn, mx) => {
+        tlMinLabel.textContent = mn + " min";
+        tlMaxLabel.textContent = mx + " min";
     });
 
     // Content age toggle + dual slider
-    const caToggle = el.querySelector("#scf-ca-toggle");
-    const caSection = el.querySelector("#scf-ca-section");
-    const caFill = el.querySelector("#scf-ca-fill");
-    const caMinSlider = el.querySelector("#scf-ca-min");
-    const caMaxSlider = el.querySelector("#scf-ca-max");
-    const caLabelEl = el.querySelector("#scf-ca-label");
-
-    function updateCaLabel() {
-        caLabelEl.textContent = caLabel(
-            uiToStorageMin(parseInt(caMinSlider.value, 10)),
-            uiToStorageMax(parseInt(caMaxSlider.value, 10))
-        );
-    }
-
-    function updateCaFill() {
-        const mn = parseInt(caMinSlider.value, 10);
-        const mx = parseInt(caMaxSlider.value, 10);
-        caFill.style.left = (mn / 31 * 100) + "%";
-        caFill.style.right = ((31 - mx) / 31 * 100) + "%";
-    }
-
-    updateCaFill();
-    updateCaLabel();
-
-    caToggle.addEventListener("change", () =>
-        caSection.classList.toggle("scf-visible", caToggle.checked)
-    );
-    caMinSlider.addEventListener("input", () => {
-        if (parseInt(caMinSlider.value, 10) > parseInt(caMaxSlider.value, 10))
-            caMinSlider.value = caMaxSlider.value;
-        updateCaLabel();
-        updateCaFill();
+    el.querySelector("#scf-ca-toggle").addEventListener("change", (e) => {
+        el.querySelector("#scf-ca-section").classList.toggle("scf-visible", e.target.checked);
     });
-    caMaxSlider.addEventListener("input", () => {
-        if (parseInt(caMaxSlider.value, 10) < Math.max(1, parseInt(caMinSlider.value, 10)))
-            caMaxSlider.value = Math.max(1, parseInt(caMinSlider.value, 10));
-        updateCaLabel();
-        updateCaFill();
+    const caLabelEl = el.querySelector("#scf-ca-label");
+    // The right knob must stay ≥ 1 — a 0-day upload cap hides everything.
+    dualSlider(el, "ca", 1, (mn, mx) => {
+        caLabelEl.textContent = caLabel(uiToStorageMin(mn), uiToStorageMax(mx));
     });
 
     // Tag filter toggle + mode + chips
@@ -1346,8 +1259,6 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
         tagWarning.hidden = !(
             tfToggle.checked && localMode === "include" && localTags.length === 0
         );
-        // Sync localTags back into the hidden tag-chips data so readPanelState can read it
-        chipContainer.dataset.tags = JSON.stringify(localTags);
     }
 
     renderChips();
@@ -1389,29 +1300,91 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose}) {
         localTags = [];
         renderChips();
     });
+
+    function readPanelState() {
+        const settings = tab.type === "settings"
+            ? JSON.parse(JSON.stringify(tab.settings))
+            : sanitizeSettings({});
+
+        settings.filterReposts.enabled = el.querySelector("#scf-fr-toggle").checked;
+        const activeSegBtn = el.querySelector("#scf-fr-sub .scf-seg-btn.scf-active");
+        if (activeSegBtn) settings.filterReposts.type = activeSegBtn.dataset.type;
+
+        settings.trackLengthInMin.enabled = el.querySelector("#scf-tl-toggle").checked;
+        settings.trackLengthInMin.min = parseInt(el.querySelector("#scf-tl-min").value, 10);
+        settings.trackLengthInMin.max = parseInt(el.querySelector("#scf-tl-max").value, 10);
+
+        settings.contentAgeInDays.enabled = el.querySelector("#scf-ca-toggle").checked;
+        settings.contentAgeInDays.min = uiToStorageMin(parseInt(el.querySelector("#scf-ca-min").value, 10));
+        settings.contentAgeInDays.max = uiToStorageMax(parseInt(el.querySelector("#scf-ca-max").value, 10));
+
+        settings.freeDownloadsOnly.enabled = el.querySelector("#scf-fd-toggle").checked;
+        settings.alreadySeen = {
+            mode: el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? settings.alreadySeen.mode,
+            source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? settings.alreadySeen.source,
+        };
+        settings.playlistFilter.enabled = el.querySelector("#scf-pf-toggle").checked;
+        settings.playlistFilter.mode = el.querySelector(".scf-pf-mode-btn.scf-active")?.dataset.mode ?? "hideLarge";
+        settings.playlistFilter.nameInTitles = el.querySelector("#scf-pf-nit-toggle").checked;
+
+        settings.tagFilter.enabled = el.querySelector("#scf-tf-toggle").checked;
+        settings.tagFilter.mode = localMode;
+        settings.tagFilter.tags = [...localTags];
+
+        return {
+            ...tab,
+            name: el.querySelector(".scf-name-input").value.trim() || tab.name,
+            settings,
+        };
+    }
 }
 
-function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange}) {
+function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onClearAllSeen}) {
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
     el.querySelector("#scf-restore-btn").addEventListener("click", onRestore);
     el.querySelector("#scf-debug-checkbox").addEventListener("change", (e) => {
         onDebugChange(e.target.checked).catch(console.error);
     });
+
+    const seenData = el.querySelector("#scf-seen-data");
+    function showSeenBytes(bytes) {
+        seenData.querySelector(".scf-seen-num").textContent = formatBytes(bytes);
+        seenData.querySelector(".scf-seen-reset-wrap").hidden = bytes === 0;
+    }
+
+    const retentionButtons = el.querySelectorAll("#scf-seen-retention .scf-seg-btn");
+    for (const btn of retentionButtons) {
+        btn.addEventListener("click", () => {
+            if (btn.classList.contains("scf-active")) return;
+            for (const b of retentionButtons) b.classList.toggle("scf-active", b === btn);
+            onRetentionChange(Number(btn.dataset.months)).then(showSeenBytes).catch(console.error);
+        });
+    }
+
+    el.querySelector("#scf-clear-seen-btn").addEventListener("click", () => {
+        if (!confirm("Forget all seen tracks?")) return;
+        onClearAllSeen().then(() => showSeenBytes(0)).catch(console.error);
+    });
 }
 
-function openSettingsPanel(tab, handlers) {
+async function openSettingsPanel(tab, handlers) {
+    const counts = {
+        tab: await seenCount(seenListIdFor(tab.id, "tab")),
+        all: await seenCount("all"),
+    };
     document.getElementById("scf-settings-panel")?.remove();
     document.getElementById("scf-global-panel")?.remove();
-    const el = buildSettingsPanel(tab);
+    const el = buildSettingsPanel(tab, {counts, retention: handlers.retention});
     attachPanelListeners(el, tab, handlers);
     attachTooltipListeners(el);
     document.body.appendChild(el);
 }
 
-function openGlobalPanel(handlers) {
+async function openGlobalPanel(handlers) {
+    const bytes = await seenBytes();
     document.getElementById("scf-global-panel")?.remove();
     document.getElementById("scf-settings-panel")?.remove();
-    const el = buildGlobalPanel(handlers.debug);
+    const el = buildGlobalPanel(handlers.debug, {retention: handlers.retention, seenBytes: bytes});
     attachGlobalPanelListeners(el, handlers);
     attachTooltipListeners(el);
     document.body.appendChild(el);
@@ -1435,48 +1408,60 @@ function waitForElement(selector) {
     });
 }
 
+// initFilters runs on every #content mutation; pruning once per page load is enough.
+let seenPruned = false;
+
 async function initFilters() {
     // Always inject filter scripts (guarded internally against double-inject)
 
-    const {tabs, activeTabId, debug} = await loadState();
+    const {tabs, activeTabId, debug, seenRetention, infoOpen} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
     injectFilterScripts(activeTab, debug);
 
     if (!window.location.href.includes("soundcloud.com/feed")) return;
 
-    injectStyles();
+    // Queued ahead of warmSeenLists, so lists load already pruned.
+    if (!seenPruned) {
+        seenPruned = true;
+        pruneSeen(seenRetention);
+    }
+
+    // Load the active tab's seen lists early so the feed's first
+    // scf:seen-query is answered without waiting on storage.
+    warmSeenLists(activeTab);
+    setInfoTab(activeTab);
 
     const header = await waitForElement(".stream__header");
     header.id = "scf-stream-header";
 
-    const tabBarEl = buildTabBar(tabs, activeTabId);
+    const tabBarEl = buildTabBar(tabs, activeTabId, {infoOpen});
     attachTabBarListeners(tabBarEl, {
         onTabClick: async (id) => {
-            const {tabs, activeTabId} = await loadState();
+            const {tabs, activeTabId, debug} = await loadState();
             if (id === activeTabId) return;
-            await saveAndResetFeed(tabs, id);
+            await saveAndResetFeed(tabs, id, debug);
             // The tab set is unchanged — just move the active highlight.
             for (const li of tabBarEl.querySelectorAll("[data-tab-id]")) {
                 li.querySelector(".g-tabs-link").classList.toggle("active", li.dataset.tabId === id);
             }
         },
         onGearClick: async (id) => {
-            const {tabs, activeTabId} = await loadState();
+            const {tabs, activeTabId, debug, seenRetention} = await loadState();
             const tab = tabs.find((t) => t.id === id);
             if (!tab) return;
-            openSettingsPanel(tab, {
+            await openSettingsPanel(tab, {
+                retention: seenRetention,
                 // onSave uses the panel-open snapshot of tabs/activeTabId intentionally.
                 // The settings panel is modal — no concurrent state changes are possible while it is open.
                 onSave: async (updatedTab) => {
                     const newTabs = tabs.map((t) => (t.id === updatedTab.id ? updatedTab : t));
                     if (updatedTab.id === activeTabId) {
-                        await saveAndResetFeed(newTabs, activeTabId);
-                        document.getElementById("scf-settings-panel")?.remove();
-                        initFilters(); // tab name may have changed — rebuild the tab bar
+                        await saveAndResetFeed(newTabs, activeTabId, debug);
                     } else {
                         await save(newTabs, activeTabId);
-                        document.getElementById("scf-settings-panel")?.remove();
                     }
+                    document.getElementById("scf-settings-panel")?.remove();
+                    initFilters(); // tab name may have changed — rebuild the tab bar
                 },
                 // Only pass onDelete when there is more than one tab — attachPanelListeners
                 // hides the Delete button when onDelete is undefined.
@@ -1485,7 +1470,7 @@ async function initFilters() {
                     if (!confirm("Delete this filter?")) return;
                     const {tabs: newTabs, newActiveId} = tabsAfterDelete(tabs, id);
                     if (id === activeTabId) {
-                        await saveAndResetFeed(newTabs, newActiveId);
+                        await saveAndResetFeed(newTabs, newActiveId, debug);
                         document.getElementById("scf-settings-panel")?.remove();
                         initFilters();
                     } else {
@@ -1493,27 +1478,42 @@ async function initFilters() {
                         document.getElementById("scf-settings-panel")?.remove();
                         initFilters();
                     }
+                    await clearSeen([seenListIdFor(id, "tab")]);
                 } : undefined,
+                onResetSeen: (listId) => resetSeenList(listId, tabs, activeTabId),
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
             });
         },
         onGlobalGearClick: async () => {
-            const {debug} = await loadState();
-            openGlobalPanel({
+            let {debug, seenRetention} = await loadState();
+            await openGlobalPanel({
                 debug,
+                retention: seenRetention,
                 onRestore: async () => {
                     const defaults = buildDefaultTabs();
-                    await saveAndResetFeed(defaults, defaults[0].id);
+                    await clearSeen(null);
+                    await saveAndResetFeed(defaults, defaults[0].id, debug);
                     document.getElementById("scf-global-panel")?.remove();
                     initFilters();
                 },
                 onDebugChange: async (enabled) => {
+                    debug = enabled;
                     await browser.storage.sync.set({scfDebug: enabled});
                     const {tabs, activeTabId} = await loadState();
                     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
                     applyConfig(activeTab, enabled, "update-only");
+                },
+                onRetentionChange: async (months) => {
+                    await browser.storage.sync.set({scfSeenRetention: months});
+                    await pruneSeen(months);
+                    return seenBytes();
+                },
+                onClearAllSeen: async () => {
+                    await clearSeen(null);
+                    const {tabs, activeTabId, debug} = await loadState();
+                    await saveAndResetFeed(tabs, activeTabId, debug);
                 },
                 onClose: () => {
                     document.getElementById("scf-global-panel")?.remove();
@@ -1521,14 +1521,15 @@ async function initFilters() {
             });
         },
         onPlusClick: async () => {
-            const {tabs, activeTabId} = await loadState();
+            const {tabs, activeTabId, seenRetention} = await loadState();
             const newTab = {
                 id: crypto.randomUUID(),
                 name: uniqueName("New Filter", tabs.map((t) => t.name)),
                 type: "settings",
                 settings: sanitizeSettings({}),
             };
-            openSettingsPanel(newTab, {
+            await openSettingsPanel(newTab, {
+                retention: seenRetention,
                 onSave: async (updatedTab) => {
                     const newTabs = [...tabs, updatedTab];
                     // NOTE: `await save(...)` is intentional — activeTabId preserved so new tab does not become active automatically.
@@ -1536,14 +1537,19 @@ async function initFilters() {
                     document.getElementById("scf-settings-panel")?.remove();
                     initFilters();
                 },
+                onResetSeen: (listId) => resetSeenList(listId, tabs, activeTabId),
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
             });
         },
+        onInfoToggle: (open) => {
+            browser.storage.sync.set({scfInfoOpen: open}).catch(console.error);
+        },
     });
 
     header.replaceChildren(tabBarEl);
+    renderInfo();
 }
 
 waitForElement("#content").then((content) => {
