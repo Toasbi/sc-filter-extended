@@ -20,6 +20,7 @@ const scfFreeDomains = [
     "premierely.io",
     "pumpyoursound.com",
     "sharepoint.com",
+    "tpstudio.space",
     "valorizd.app",
     "vlrz.me",
 ];
@@ -90,6 +91,21 @@ function applyActivityTypeFilter(url, config) {
     return parsed.toString();
 }
 
+// Path of a permalink, comparable with linkPath(); null if unparseable.
+function permalinkPath(url) {
+    if (typeof url !== "string") return null;
+    try {
+        return new URL(url, "https://soundcloud.com").pathname.replace(/\/+$/, "") || null;
+    } catch (_e) {
+        return null;
+    }
+}
+
+// Anchors expose an already-parsed path, so no URL is built per feed link.
+function linkPath(link) {
+    return link.pathname?.replace(/\/+$/, "") || null;
+}
+
 // Returns every track id in a stream response collection: the track of each
 // track / track-repost item plus the tracks inside playlists. This is what
 // filter.js asks content.js about in scf:seen-query.
@@ -147,8 +163,8 @@ function shouldFilterTrack(track, settings, seenIds, debug) {
 }
 
 // Returns true if the playlist should be removed.
-// shown: array the caller reports to content.js as scf:seen; a passing
-// single-track playlist pushes its track id.
+// shown: {id, path, title} entries recorded as seen once on screen; a passing
+// single-track playlist pushes its track under the playlist's link.
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
 function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
     // hideAll is enforced server-side via the activityTypes rewrite, but
@@ -207,14 +223,14 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
     // Single-track playlists mark the track as seen (used to bump feed position).
     if (tracks.length === 1) {
         seenIds.add(tracks[0].id);
-        shown.push(tracks[0].id);
+        shown.push({id: tracks[0].id, path: permalinkPath(playlist.permalink_url), title: playlist.title});
     }
     return false;
 }
 
 // Returns true if item should be removed from the feed.
-// seenIds (the per-response set) and shown (the ids reported back to
-// content.js) are mutated in two places: here (when a track passes) and inside
+// seenIds (the per-response set) and shown (the entries recorded as seen once
+// on screen) are mutated in two places: here (when a track passes) and inside
 // shouldFilterPlaylist (single-track playlists mark the track seen directly).
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
 function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) {
@@ -316,7 +332,7 @@ function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) 
         const filtered = shouldFilterTrack(item.track, settings, seenIds, debug);
         if (!filtered) {
             seenIds.add(item.track.id);
-            shown.push(item.track.id);
+            shown.push({id: item.track.id, path: permalinkPath(item.track.permalink_url), title: item.track.title});
         }
         return filtered;
     }
@@ -647,6 +663,10 @@ function reportSeen(tabId, ids) {
     // Skip counters for the loading-spinner info text; reset on every feed reset.
     let scfSkipped = 0; // items hidden by the active filter in this feed view
     let scfScanned = 0; // total items seen in this feed view
+    // Shown tracks count as seen once their feed link is on screen, not when
+    // their page loads. Both are cleared on every feed reset.
+    const scfUnseen = new Map(); // link path → {tabId, id, title}
+    const scfShownInView = new Set(); // hides repeats of not-yet-seen tracks under "on"
     // Mutable: re-read from the dataset on every scf:apply-config event.
     let config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
     // Start fetching followings immediately — no await here is intentional.
@@ -683,6 +703,63 @@ function reportSeen(tabId, ids) {
         document.dispatchEvent(new CustomEvent("scf:stats", {
             detail: JSON.stringify({tabId, filtered: scfSkipped, scanned: scfScanned}),
         }));
+    }
+
+    // The browser reports when a watched link enters the viewport, so scrolling
+    // runs no script, and a hidden tab (which doesn't render) records nothing.
+    const scfOnScreen = new IntersectionObserver((entries) => {
+        const byTab = new Map();
+        for (const {target, isIntersecting} of entries) {
+            if (!isIntersecting) continue;
+            scfOnScreen.unobserve(target);
+            const path = linkPath(target);
+            const entry = scfUnseen.get(path);
+            if (!entry) continue;
+            scfUnseen.delete(path);
+            if (!byTab.has(entry.tabId)) byTab.set(entry.tabId, []);
+            byTab.get(entry.tabId).push(entry.id);
+            if (config?.debug) console.log(`[SCF] seen on screen "${entry.title}"`);
+        }
+        for (const [tabId, ids] of byTab) reportSeen(tabId, ids);
+        if (scfUnseen.size === 0) scfStopWatchingFeed();
+    });
+
+    // Links outside the feed (other pages, the player bar) prove nothing.
+    function scfFeedLinksIn(node) {
+        if (node?.nodeType !== 1) return [];
+        if (!node.closest(".stream__list")) return node.querySelectorAll(".stream__list a[href]");
+        const links = [...node.querySelectorAll("a[href]")];
+        if (node.matches("a[href]")) links.push(node);
+        return links;
+    }
+
+    function scfWatchLinks(links) {
+        for (const link of links) {
+            if (scfUnseen.has(linkPath(link))) scfOnScreen.observe(link);
+        }
+    }
+
+    // Catches items whenever SoundCloud renders them, including lazily on
+    // scroll. Only reads the DOM, so it cannot re-trigger itself.
+    const scfFeedWatcher = new MutationObserver((records) => {
+        for (const record of records) {
+            for (const node of record.addedNodes) scfWatchLinks(scfFeedLinksIn(node));
+        }
+    });
+
+    // Once connected, the watcher sees every later render, so the full scan
+    // only has to catch what was on the page before.
+    let scfFeedWatched = false;
+    function scfWatchFeed() {
+        if (scfFeedWatched || scfUnseen.size === 0) return;
+        scfFeedWatched = true;
+        scfFeedWatcher.observe(document.documentElement, {childList: true, subtree: true});
+        scfWatchLinks(scfFeedLinksIn(document.querySelector(".stream__list")));
+    }
+
+    function scfStopWatchingFeed() {
+        scfFeedWatched = false;
+        scfFeedWatcher.disconnect();
     }
 
     // Capture the request URL in open() so it is available in send().
@@ -735,12 +812,15 @@ function reportSeen(tabId, ids) {
                 Promise.all([followings, seenPromise]).then(([followingData, seen]) => {
                     try {
                         if (cfg) {
+                            if (seenMode === "on") {
+                                for (const id of scfShownInView) seen.add(id);
+                            }
                             const responseData = JSON.parse(xhr.responseText);
                             // The stop check must see the raw page: items that survive
                             // filtering always satisfy the age cap, so the filtered
                             // collection could never trip it.
                             const rawCollection = responseData.collection;
-                            const shown = []; // track ids that passed every filter
+                            const shown = []; // {id, path, title} of tracks that passed every filter
                             responseData.collection = rawCollection.filter((item) => {
                                 const label = item.track?.title ?? item.playlist?.title ?? item.type;
                                 if (cfg.type === "deepCuts") {
@@ -765,8 +845,17 @@ function reportSeen(tabId, ids) {
                             }
                             Object.defineProperty(xhr, "responseText", {value: JSON.stringify(responseData), configurable: true});
 
-                            // On and Paused record what this page showed; Off records nothing.
-                            if (seenMode !== "off" && shown.length > 0) reportSeen(cfg.id, shown);
+                            // On and Paused record what gets on screen; Off records nothing.
+                            if (seenMode !== "off") {
+                                const unlinked = [];
+                                for (const {id, path, title} of shown) {
+                                    if (seenMode === "on") scfShownInView.add(id);
+                                    if (path) scfUnseen.set(path, {tabId: cfg.id, id, title});
+                                    else unlinked.push(id);
+                                }
+                                if (unlinked.length > 0) reportSeen(cfg.id, unlinked);
+                                scfWatchFeed();
+                            }
                         }
                     } catch (e) {
                         // Non-JSON / rate-limited / unexpected-shape response. Never
@@ -791,6 +880,10 @@ function reportSeen(tabId, ids) {
         if (event.detail !== "reset-feed") return;
         scfSkipped = 0;
         scfScanned = 0;
+        scfUnseen.clear();
+        scfShownInView.clear();
+        scfOnScreen.disconnect();
+        scfStopWatchingFeed();
         scfUpdateSkipInfo();
         scfReportStats(config?.id);
         // softResetFeed rejects when the SoundCloud internals can't be found or

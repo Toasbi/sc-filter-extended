@@ -24,11 +24,12 @@ const VALID_SEEN_SOURCES = new Set(["tab", "all"]);
 const SEEN_RETENTION_LABELS = {1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year"};
 const DEFAULT_SEEN_RETENTION = 12;
 
-const VALID_FILTER_REPOSTS_TYPES = new Set([
-    "allowNone",
-    "allowRepostedTracksOfFollowers",
-    "allowOnlyFromNotFollowing",
-]);
+const REPOST_TYPE_LABELS = {
+    allowNone: "Block all",
+    allowRepostedTracksOfFollowers: "Allow from followers",
+    allowOnlyFromNotFollowing: "Allow not following",
+};
+const VALID_FILTER_REPOSTS_TYPES = new Set(Object.keys(REPOST_TYPE_LABELS));
 
 const VALID_PLAYLIST_FILTER_MODES = new Set(["hideLarge", "hideAll"]);
 
@@ -121,6 +122,13 @@ function caLabel(min, max) {
     return parts.join(", ");
 }
 
+// filter.js clamps durations to this, so the slider's top end means "no upper limit".
+const TRACK_LENGTH_MAX_MIN = 120;
+
+function tlLabel(minutes) {
+    return minutes >= TRACK_LENGTH_MAX_MIN ? `${minutes}+ min` : `${minutes} min`;
+}
+
 // ── Pure: tab helpers ─────────────────────────────────────────────────────────
 
 function buildDefaultTabs() {
@@ -163,7 +171,7 @@ function buildDefaultTabs() {
             type: "settings",
             settings: sanitizeSettings({
                 filterReposts: {enabled: true, type: "allowNone"},
-                trackLengthInMin: {enabled: true, min: 45, max: 120},
+                trackLengthInMin: {enabled: true, min: 45, max: TRACK_LENGTH_MAX_MIN},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true},
             }),
         },
@@ -172,7 +180,7 @@ function buildDefaultTabs() {
             name: "Downtempo mixes",
             type: "settings",
             settings: sanitizeSettings({
-                trackLengthInMin: {enabled: true, min: 45, max: 120},
+                trackLengthInMin: {enabled: true, min: 45, max: TRACK_LENGTH_MAX_MIN},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true},
                 tagFilter: {enabled: true, mode: "include", tags: ["downtempo"]}
             }),
@@ -214,6 +222,25 @@ function uniqueName(name, existingNames) {
     let n = 2;
     while (nameSet.has(`${name} (${n})`)) n++;
     return `${name} (${n})`;
+}
+
+function withSeenMode(tab, mode) {
+    return {...tab, settings: {...tab.settings, alreadySeen: {...tab.settings.alreadySeen, mode}}};
+}
+
+// Flips the active tab between "on" and "paused"; returns `tabs` itself when there is nothing to flip.
+function tabsWithSeenPauseToggled(tabs, activeTabId) {
+    const active = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+    if (active?.type !== "settings") return tabs;
+    const {mode} = active.settings.alreadySeen;
+    if (mode === "off") return tabs;
+    return tabs.map((t) => (t === active ? withSeenMode(t, mode === "on" ? "paused" : "on") : t));
+}
+
+// The panel only decides on vs off; whether hiding is paused belongs to the tab bar.
+function withStoredPause(tab, stored) {
+    if (tab.type !== "settings" || tab.settings.alreadySeen.mode === "off") return tab;
+    return withSeenMode(tab, stored.settings.alreadySeen.mode === "paused" ? "paused" : "on");
 }
 
 // Returns tabs with the entry matching `id` removed and the new active id.
@@ -440,7 +467,7 @@ function recordSeen(tabId, ids) {
     }
     if (added) {
         scheduleSeenFlush();
-        refreshInfoCounts();
+        scheduleInfoRefresh();
     }
 }
 
@@ -587,13 +614,13 @@ function seenBytes() {
 }
 
 // Clears a list and rebuilds the feed only if the active tab currently hides against it.
-async function resetSeenList(listId, tabs, activeTabId) {
+async function resetSeenList(listId) {
     await clearSeen([listId]);
+    const {tabs, activeTabId, debug} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
     if (activeTab.type !== "settings") return;
     const {mode, source} = activeTab.settings.alreadySeen;
     if (mode === "on" && seenListIdFor(activeTab.id, source) === listId) {
-        const {debug} = await loadState();
         await saveAndResetFeed(tabs, activeTabId, debug);
     }
 }
@@ -647,6 +674,17 @@ function setInfoTab(tab) {
     renderInfo();
 }
 
+let infoRefreshTimer = null;
+
+// recordSeen runs once per track scrolled on screen; one count read per burst is enough.
+function scheduleInfoRefresh() {
+    if (infoRefreshTimer !== null) return;
+    infoRefreshTimer = setTimeout(() => {
+        infoRefreshTimer = null;
+        refreshInfoCounts();
+    }, 500);
+}
+
 async function refreshInfoCounts() {
     const tab = infoTab;
     if (!tab) return;
@@ -668,8 +706,14 @@ function renderInfo() {
         ? infoTab.settings.alreadySeen
         : {mode: "off", source: "tab"};
     const off = mode === "off";
+    const paused = mode === "paused";
+    const toggle = item.querySelector(".scf-seen-toggle");
+    toggle.hidden = off;
+    toggle.classList.toggle("scf-paused", paused);
+    toggle.querySelector(".scf-seen-toggle-label").textContent = paused ? "Resume hiding" : "Pause hiding";
+    toggle.title = paused ? "Hide seen tracks on this tab again" : "Show hidden tracks temporarily";
     item.querySelector(".scf-info-seen-label").textContent =
-        off ? "Seen: off" : mode === "paused" ? "Seen (paused):" : "Seen:";
+        off ? "Seen: off" : paused ? "Seen (paused):" : "Seen:";
     for (const el of item.querySelectorAll(".scf-info-seen")) {
         const count = formatCount(infoCounts[el.dataset.source]);
         el.textContent = `${count} ${el.dataset.source === "all" ? "all tabs" : "this tab"}`;
@@ -679,7 +723,7 @@ function renderInfo() {
     item.querySelector(".scf-info-seen-sep").hidden = off;
     const {filtered, scanned} = infoStats ?? {filtered: 0, scanned: 0};
     item.querySelector(".scf-info-filtered").textContent =
-        `Filtered: ${formatCount(filtered)} of ${formatCount(scanned)}`;
+        `Skipped: ${formatCount(filtered)} of ${formatCount(scanned)}`;
 }
 
 document.addEventListener("scf:stats", (event) => {
@@ -810,7 +854,12 @@ function buildTabBar(tabs, activeId, {infoOpen}) {
     // Numbers are filled in by renderInfo().
     const infoLi = document.createElement("li");
     infoLi.className = "g-tabs-item scf-info-item";
-    infoLi.innerHTML = `<a class="g-tabs-link scf-info-link" href="#"><svg width="13" height="13" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1Zm0 1.5a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11ZM7.25 7h1.5v4.5h-1.5V7ZM8 4.1a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z"/></svg></a>
+    infoLi.innerHTML = `<button class="scf-seen-toggle" hidden>
+        <svg class="scf-seen-pause-icon" width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="3" y="2" width="3.5" height="12" rx="1"/><rect x="9.5" y="2" width="3.5" height="12" rx="1"/></svg>
+        <svg class="scf-seen-play-icon" width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2.5v11a1 1 0 0 0 1.5.86l9-5.5a1 1 0 0 0 0-1.72l-9-5.5A1 1 0 0 0 4 2.5Z"/></svg>
+        <span class="scf-seen-toggle-label"></span>
+      </button>
+      <a class="g-tabs-link scf-info-link" href="#"><svg width="13" height="13" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1Zm0 1.5a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11ZM7.25 7h1.5v4.5h-1.5V7ZM8 4.1a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z"/></svg></a>
       <span class="scf-info-body">
         <span class="scf-info-seen-label"></span>
         <span class="scf-info-seen" data-source="all"></span>
@@ -841,6 +890,20 @@ const PLAYLIST_INFO = {
     hideAll: "All playlists are hidden from your feed.",
 };
 
+function selectHtml(id, labels, selected) {
+    const options = Object.entries(labels).map(([value, label]) =>
+        `<option value="${value}"${value === String(selected) ? " selected" : ""}>${label}</option>`
+    ).join("");
+    return `<div class="scf-select-wrap">
+          <select class="scf-select" id="${id}">${options}</select>
+          <svg class="scf-select-chevron" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+        </div>`;
+}
+
+function retentionTip(months) {
+    return `Hides seen tracks for ${SEEN_RETENTION_LABELS[months]}, then they show up again. Applies to every tab.`;
+}
+
 function seenCountLine(source, label, count, activeSource) {
     return `<div class="scf-seen-count${source === activeSource ? "" : " scf-seen-count-muted"}" data-source="${source}" data-count="${count}">
           ${label}: <span class="scf-seen-num">${formatCount(count)}</span> seen<span class="scf-seen-reset-wrap"${count === 0 ? " hidden" : ""}> · <button class="scf-seen-reset">Reset</button></span>
@@ -858,93 +921,97 @@ function buildSettingsPanel(tab, {counts, retention}) {
       <button class="scf-close-btn" title="Close">×</button>
     </div>
     <div class="scf-body">
-      <div class="scf-row">
-        <span class="scf-row-label">Repost filter <span class="scf-help" data-tip="Block all reposts, allow only from people you follow, or show only from people you don't follow.">?</span></span>
-        <label class="scf-toggle">
-          <input type="checkbox" id="scf-fr-toggle"${s.filterReposts.enabled ? " checked" : ""}>
-          <span class="scf-toggle-track"></span>
-        </label>
-      </div>
-      <div class="scf-sub-section${s.filterReposts.enabled ? " scf-visible" : ""}" id="scf-fr-sub">
-        <div class="scf-segmented">
-          <button class="scf-seg-btn${s.filterReposts.type === "allowNone" ? " scf-active" : ""}" data-type="allowNone">Block all</button>
-          <button class="scf-seg-btn${s.filterReposts.type === "allowRepostedTracksOfFollowers" ? " scf-active" : ""}" data-type="allowRepostedTracksOfFollowers">Allow from followers</button>
-          <button class="scf-seg-btn${s.filterReposts.type === "allowOnlyFromNotFollowing" ? " scf-active" : ""}" data-type="allowOnlyFromNotFollowing">Allow not following</button>
-        </div>
-        <p id="scf-fr-info" class="scf-filter-info">${REPOST_INFO[s.filterReposts.type] ?? ""}</p>
-      </div>
-
-      <div class="scf-row">
-        <span class="scf-row-label">Playlist filter <span class="scf-help" data-tip="Controls how playlists are handled in your feed.">?</span></span>
-        <label class="scf-toggle">
-          <input type="checkbox" id="scf-pf-toggle"${s.playlistFilter.enabled ? " checked" : ""}>
-          <span class="scf-toggle-track"></span>
-        </label>
-      </div>
-      <div class="scf-sub-section${s.playlistFilter.enabled ? " scf-visible" : ""}" id="scf-pf-sub">
-        <div class="scf-segmented">
-          <button class="scf-pf-mode-btn${s.playlistFilter.mode === "hideLarge" ? " scf-active" : ""}" data-mode="hideLarge">Hide large</button>
-          <button class="scf-pf-mode-btn${s.playlistFilter.mode === "hideAll" ? " scf-active" : ""}" data-mode="hideAll">Hide all</button>
-        </div>
-        <p id="scf-pf-info" class="scf-filter-info">${PLAYLIST_INFO[s.playlistFilter.mode] ?? ""}</p>
-        <div class="scf-row${s.playlistFilter.mode !== "hideLarge" ? " scf-row-disabled" : ""}" id="scf-pf-nit-row">
-          <span class="scf-row-label">Reposter name in titles <span class="scf-help" data-tip="Only show playlists where the reposter's username appears in at least one track title. Only available when Hide large mode is selected.">?</span></span>
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Repost filter <span class="scf-help" data-tip="Block all reposts, allow only from people you follow, or show only from people you don't follow.">?</span></span>
           <label class="scf-toggle">
-            <input type="checkbox" id="scf-pf-nit-toggle"${s.playlistFilter.nameInTitles ? " checked" : ""}${s.playlistFilter.mode !== "hideLarge" ? " disabled" : ""}>
+            <input type="checkbox" id="scf-fr-toggle"${s.filterReposts.enabled ? " checked" : ""}>
             <span class="scf-toggle-track"></span>
           </label>
         </div>
-      </div>
-
-      <div class="scf-row">
-        <span class="scf-row-label">Tag filter <span class="scf-help" data-tip="Include mode: only show items matching your tags. Exclude mode: hide items with your tags.">?</span></span>
-        <label class="scf-toggle">
-          <input type="checkbox" id="scf-tf-toggle"${s.tagFilter.enabled ? " checked" : ""}>
-          <span class="scf-toggle-track"></span>
-        </label>
-      </div>
-      <div id="scf-tag-section" class="scf-tag-section${s.tagFilter.enabled ? " scf-visible" : ""}">
-        <div class="scf-tag-mode-row">
-          <button id="scf-tf-include" class="scf-tag-mode-btn${s.tagFilter.mode === "include" ? " scf-active" : ""}">Include</button>
-          <button id="scf-tf-exclude" class="scf-tag-mode-btn${s.tagFilter.mode === "exclude" ? " scf-active" : ""}">Exclude</button>
-        </div>
-        <div class="scf-tag-input-row">
-          <input type="text" id="scf-tf-input" class="scf-tag-input" placeholder="add tag…">
-          <button id="scf-tf-add" class="scf-tag-add-btn">Add</button>
-        </div>
-        <div id="scf-tag-chips" class="scf-tag-chips"></div>
-        <p class="scf-warning" id="scf-tf-warning"${!(s.tagFilter.enabled && s.tagFilter.mode === "include" && s.tagFilter.tags.length === 0) ? " hidden" : ""}>⚠ Include mode with no tags will hide everything</p>
-        <button id="scf-tf-clear" class="scf-tag-clear-btn">Clear all</button>
-      </div>
-
-      <div class="scf-row">
-        <span class="scf-row-label">Track length <span class="scf-help" data-tip="Filter tracks by duration in minutes.">?</span></span>
-        <label class="scf-toggle">
-          <input type="checkbox" id="scf-tl-toggle"${s.trackLengthInMin.enabled ? " checked" : ""}>
-          <span class="scf-toggle-track"></span>
-        </label>
-      </div>
-      <div class="scf-slider-section${s.trackLengthInMin.enabled ? " scf-visible" : ""}" id="scf-tl-section">
-        <div class="scf-slider-labels">
-          <span id="scf-tl-min-label">${s.trackLengthInMin.min} min</span>
-          <span id="scf-tl-max-label">${s.trackLengthInMin.max} min</span>
-        </div>
-        <div class="scf-slider-wrap">
-          <div class="scf-slider-base"></div>
-          <div class="scf-slider-fill" id="scf-tl-fill"></div>
-          <input type="range" id="scf-tl-min" min="0" max="120" step="1" value="${s.trackLengthInMin.min}">
-          <input type="range" id="scf-tl-max" min="0" max="120" step="1" value="${s.trackLengthInMin.max}">
+        <div class="scf-sub-section${s.filterReposts.enabled ? " scf-visible" : ""}" id="scf-fr-sub">
+          ${selectHtml("scf-fr-type", REPOST_TYPE_LABELS, s.filterReposts.type)}
+          <p id="scf-fr-info" class="scf-filter-info">${REPOST_INFO[s.filterReposts.type] ?? ""}</p>
         </div>
       </div>
 
-      <div class="scf-row">
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Playlist filter <span class="scf-help" data-tip="Controls how playlists are handled in your feed.">?</span></span>
+          <label class="scf-toggle">
+            <input type="checkbox" id="scf-pf-toggle"${s.playlistFilter.enabled ? " checked" : ""}>
+            <span class="scf-toggle-track"></span>
+          </label>
+        </div>
+        <div class="scf-sub-section${s.playlistFilter.enabled ? " scf-visible" : ""}" id="scf-pf-sub">
+          <div class="scf-segmented" id="scf-pf-mode">
+            <button class="scf-seg-btn${s.playlistFilter.mode === "hideLarge" ? " scf-active" : ""}" data-mode="hideLarge">Hide large</button>
+            <button class="scf-seg-btn${s.playlistFilter.mode === "hideAll" ? " scf-active" : ""}" data-mode="hideAll">Hide all</button>
+          </div>
+          <p id="scf-pf-info" class="scf-filter-info">${PLAYLIST_INFO[s.playlistFilter.mode] ?? ""}</p>
+          <div class="scf-inline-row${s.playlistFilter.mode !== "hideLarge" ? " scf-row-disabled" : ""}" id="scf-pf-nit-row">
+            <span class="scf-row-label">Reposter name in titles <span class="scf-help" data-tip="Only show playlists where the reposter's username appears in at least one track title. Only available when Hide large mode is selected.">?</span></span>
+            <label class="scf-toggle">
+              <input type="checkbox" id="scf-pf-nit-toggle"${s.playlistFilter.nameInTitles ? " checked" : ""}${s.playlistFilter.mode !== "hideLarge" ? " disabled" : ""}>
+              <span class="scf-toggle-track"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Tag filter <span class="scf-help" data-tip="Include mode: only show items matching your tags. Exclude mode: hide items with your tags.">?</span></span>
+          <label class="scf-toggle">
+            <input type="checkbox" id="scf-tf-toggle"${s.tagFilter.enabled ? " checked" : ""}>
+            <span class="scf-toggle-track"></span>
+          </label>
+        </div>
+        <div id="scf-tag-section" class="scf-sub-section${s.tagFilter.enabled ? " scf-visible" : ""}">
+          <div class="scf-segmented">
+            <button id="scf-tf-include" class="scf-seg-btn${s.tagFilter.mode === "include" ? " scf-active" : ""}">Include</button>
+            <button id="scf-tf-exclude" class="scf-seg-btn${s.tagFilter.mode === "exclude" ? " scf-active" : ""}">Exclude</button>
+          </div>
+          <div class="scf-tag-input-row">
+            <input type="text" id="scf-tf-input" class="scf-tag-input" placeholder="add tag…">
+            <button id="scf-tf-add" class="scf-btn scf-btn-sm scf-tag-add-btn">Add</button>
+          </div>
+          <div id="scf-tag-chips" class="scf-tag-chips"></div>
+          <p class="scf-warning" id="scf-tf-warning"${!(s.tagFilter.enabled && s.tagFilter.mode === "include" && s.tagFilter.tags.length === 0) ? " hidden" : ""}>⚠ Include mode with no tags will hide everything</p>
+        </div>
+      </div>
+
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Track length <span class="scf-help" data-tip="Filter tracks by duration in minutes.">?</span></span>
+          <label class="scf-toggle">
+            <input type="checkbox" id="scf-tl-toggle"${s.trackLengthInMin.enabled ? " checked" : ""}>
+            <span class="scf-toggle-track"></span>
+          </label>
+        </div>
+        <div class="scf-sub-section scf-slider-section${s.trackLengthInMin.enabled ? " scf-visible" : ""}" id="scf-tl-section">
+          <div class="scf-slider-labels">
+            <span id="scf-tl-min-label">${tlLabel(s.trackLengthInMin.min)}</span>
+            <span id="scf-tl-max-label">${tlLabel(s.trackLengthInMin.max)}</span>
+          </div>
+          <div class="scf-slider-wrap">
+            <div class="scf-slider-base"></div>
+            <div class="scf-slider-fill" id="scf-tl-fill"></div>
+            <input type="range" id="scf-tl-min" min="0" max="${TRACK_LENGTH_MAX_MIN}" step="1" value="${s.trackLengthInMin.min}">
+            <input type="range" id="scf-tl-max" min="0" max="${TRACK_LENGTH_MAX_MIN}" step="1" value="${s.trackLengthInMin.max}">
+          </div>
+        </div>
+      </div>
+
+      <div class="scf-group">
+        <div class="scf-row">
           <span class="scf-row-label">Content age <span class="scf-help" data-tip="Filter by how long ago tracks appeared in your feed (left) and were uploaded (right).">?</span></span>
           <label class="scf-toggle">
             <input type="checkbox" id="scf-ca-toggle"${s.contentAgeInDays.enabled ? " checked" : ""}>
             <span class="scf-toggle-track"></span>
           </label>
         </div>
-        <div class="scf-slider-section${s.contentAgeInDays.enabled ? " scf-visible" : ""}" id="scf-ca-section">
+        <div class="scf-sub-section scf-slider-section${s.contentAgeInDays.enabled ? " scf-visible" : ""}" id="scf-ca-section">
           <div class="scf-slider-labels" id="scf-ca-label">${caLabel(s.contentAgeInDays.min, s.contentAgeInDays.max)}</div>
           <div class="scf-slider-wrap">
             <div class="scf-slider-base"></div>
@@ -953,6 +1020,7 @@ function buildSettingsPanel(tab, {counts, retention}) {
             <input type="range" id="scf-ca-max" min="0" max="31" step="1" value="${storageToUiMax(s.contentAgeInDays.max)}">
           </div>
         </div>
+      </div>
 
       <div class="scf-row">
         <span class="scf-row-label">Free downloads only <span class="scf-help" data-tip="Only show tracks with a free download link.">?</span></span>
@@ -961,24 +1029,28 @@ function buildSettingsPanel(tab, {counts, retention}) {
           <span class="scf-toggle-track"></span>
         </label>
       </div>
-      <div class="scf-row">
-        <span class="scf-row-label">Hide seen tracks <span class="scf-help" data-tip="Hides tracks you've already seen, for ${SEEN_RETENTION_LABELS[retention]}. Paused keeps recording without hiding.">?</span></span>
-        <div class="scf-segmented" id="scf-as-mode">
-          <button class="scf-seg-btn${s.alreadySeen.mode === "on" ? " scf-active" : ""}" data-mode="on">On</button>
-          <button class="scf-seg-btn${s.alreadySeen.mode === "paused" ? " scf-active" : ""}" data-mode="paused">Paused</button>
-          <button class="scf-seg-btn${s.alreadySeen.mode === "off" ? " scf-active" : ""}" data-mode="off">Off</button>
+
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Hide seen tracks <span class="scf-help" data-tip="Hides tracks you've already seen, for ${SEEN_RETENTION_LABELS[retention]}. Pause it from the tab bar to show them temporarily.">?</span></span>
+          <label class="scf-toggle">
+            <input type="checkbox" id="scf-as-toggle"${s.alreadySeen.mode !== "off" ? " checked" : ""}>
+            <span class="scf-toggle-track"></span>
+          </label>
         </div>
-      </div>
-      <div class="scf-sub-section${s.alreadySeen.mode !== "off" ? " scf-visible" : ""}" id="scf-as-sub">
-        <div class="scf-row" id="scf-as-source-row">
-          <span class="scf-row-label">Hide tracks seen in</span>
-          <div class="scf-segmented" id="scf-as-source">
-            <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">This tab</button>
-            <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">All tabs</button>
+        <div class="scf-sub-section${s.alreadySeen.mode !== "off" ? " scf-visible" : ""}" id="scf-as-sub">
+          <div class="scf-inline-row">
+            <span class="scf-row-label">Hide tracks seen in</span>
+            <div class="scf-segmented" id="scf-as-source">
+              <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">This tab</button>
+              <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">Any tab</button>
+            </div>
+          </div>
+          <div>
+            ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
+            ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
           </div>
         </div>
-        ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
-        ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
       </div>
     </div>
     <div class="scf-panel-footer">
@@ -994,10 +1066,6 @@ function buildSettingsPanel(tab, {counts, retention}) {
 }
 
 function buildGlobalPanel(debug, {retention, seenBytes}) {
-    const retentionButtons = Object.keys(SEEN_RETENTION_LABELS).map((m) => {
-        const label = m === "12" ? "1 yr" : `${m} mo`;
-        return `<button class="scf-seg-btn${Number(m) === retention ? " scf-active" : ""}" data-months="${m}">${label}</button>`;
-    }).join("");
     const panel = document.createElement("div");
     panel.id = "scf-global-panel";
     panel.innerHTML = `
@@ -1006,22 +1074,13 @@ function buildGlobalPanel(debug, {retention, seenBytes}) {
       <button class="scf-close-btn" title="Close">×</button>
     </div>
     <div class="scf-body">
-      <div class="scf-global-links">
-        <a class="scf-coffee-btn" href="${BUY_ME_A_COFFEE_URL}" target="_blank" rel="noopener noreferrer">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M20.216 6.415l-.132-.666c-.119-.598-.388-1.163-1.001-1.379-.197-.069-.42-.098-.57-.241-.152-.143-.196-.366-.231-.572-.065-.378-.125-.756-.192-1.133-.057-.325-.102-.69-.25-.987-.195-.4-.597-.634-.996-.788a5.723 5.723 0 00-.626-.194c-1-.263-2.05-.36-3.077-.416a25.834 25.834 0 00-3.7.062c-.915.083-1.88.184-2.75.5-.318.116-.646.256-.888.501-.297.302-.393.77-.177 1.146.154.267.415.456.692.58.36.162.737.284 1.123.366 1.075.238 2.189.331 3.287.37 1.218.05 2.437.01 3.65-.118.299-.033.598-.073.896-.119.352-.054.578-.513.474-.834-.124-.383-.457-.531-.834-.473-.466.074-.96.108-1.382.146-1.177.08-2.358.082-3.536.006a22.228 22.228 0 01-1.157-.107c-.086-.01-.18-.025-.258-.036-.243-.036-.484-.08-.724-.13-.111-.027-.111-.185 0-.212h.005c.277-.06.557-.108.838-.147h.002c.131-.009.263-.032.394-.048a25.076 25.076 0 013.426-.12c.674.019 1.347.067 2.017.144l.228.031c.267.04.533.088.798.145.392.085.895.113 1.07.542.055.137.08.288.111.431l.319 1.484a.237.237 0 01-.199.284h-.003c-.037.006-.075.01-.112.015a36.704 36.704 0 01-4.743.295 37.059 37.059 0 01-4.699-.304c-.14-.017-.293-.042-.417-.06-.326-.048-.649-.108-.973-.161-.393-.065-.768-.032-1.123.161-.29.16-.527.404-.675.701-.154.316-.199.66-.267 1.001-.069.34-.176.707-.135 1.056.087.753.613 1.365 1.37 1.502a39.69 39.69 0 0011.343.376.483.483 0 01.535.53l-.071.697-1.018 9.907c-.041.41-.047.832-.125 1.237-.122.637-.553 1.028-1.182 1.171-.577.131-1.165.2-1.756.205-.656.004-1.31-.025-1.966-.022-.699.004-1.556-.06-2.095-.58-.475-.458-.54-1.174-.605-1.793l-.731-7.13-.322-3.152c-.037-.36-.351-.634-.708-.618-.339.014-.618.322-.579.694l.318 3.106.907 8.844c.083.808.83 1.6 1.664 1.789.905.204 1.803.238 2.719.243 1.19.007 2.401.007 3.567-.238.85-.178 1.696-.579 2.077-1.412.145-.318.244-.686.312-1.027.09-.457.14-.919.19-1.379l.24-2.2.522-4.789.19-1.751a.237.237 0 01.264-.209c.31.045.63.108.94.16.42.07.844.14 1.267.212 1.24.207 2.454.481 3.685.717.35.067.7.146 1.05.187a.237.237 0 01.208.263l-.174 1.61c-.041.376.207.7.579.72.339.017.626-.247.663-.585l.393-3.625c.017-.16.017-.322-.02-.48z"/></svg>
-          <span>Buy me a coffee</span>
-        </a>
-        <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
+      <div class="scf-row">
+        <span class="scf-row-label">Remember seen tracks <span class="scf-help" id="scf-seen-retention-help" data-tip="${retentionTip(retention)}">?</span></span>
+        ${selectHtml("scf-seen-retention", SEEN_RETENTION_LABELS, retention)}
       </div>
-      <button class="scf-restore-btn" id="scf-restore-btn">Restore default tabs</button>
-      <div class="scf-row" id="scf-seen-retention-row">
-        <span class="scf-row-label">Remember seen tracks for <span class="scf-help" data-tip="Seen tracks older than this show up again. Applies to every tab.">?</span></span>
-      </div>
-      <div class="scf-global-seen">
-        <div class="scf-segmented" id="scf-seen-retention">${retentionButtons}</div>
-        <div class="scf-seen-count" id="scf-seen-data">
-          Seen data: <span class="scf-seen-num">${formatBytes(seenBytes)}</span><span class="scf-seen-reset-wrap"${seenBytes === 0 ? " hidden" : ""}> · <button class="scf-seen-reset" id="scf-clear-seen-btn">Clear all seen tracks</button></span>
-        </div>
+      <div class="scf-row" id="scf-seen-data">
+        <span class="scf-row-label">Seen data <span class="scf-seen-bytes">· <span class="scf-seen-num">${formatBytes(seenBytes)}</span></span></span>
+        <button class="scf-seen-reset" id="scf-clear-seen-btn"${seenBytes === 0 ? " hidden" : ""}>Clear all</button>
       </div>
       <div class="scf-row">
         <span class="scf-row-label">Debug logging <span class="scf-help" data-tip="Logs each feed item and why it was shown or filtered to the browser console (DevTools → Console).">?</span></span>
@@ -1030,6 +1089,17 @@ function buildGlobalPanel(debug, {retention, seenBytes}) {
           <span class="scf-toggle-track"></span>
         </label>
       </div>
+      <div class="scf-row">
+        <span class="scf-row-label">Default tabs</span>
+        <button class="scf-btn scf-btn-sm" id="scf-restore-btn">Restore</button>
+      </div>
+    </div>
+    <div class="scf-global-links">
+      <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
+      <a class="scf-coffee-btn" href="${BUY_ME_A_COFFEE_URL}" target="_blank" rel="noopener noreferrer">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M20.216 6.415l-.132-.666c-.119-.598-.388-1.163-1.001-1.379-.197-.069-.42-.098-.57-.241-.152-.143-.196-.366-.231-.572-.065-.378-.125-.756-.192-1.133-.057-.325-.102-.69-.25-.987-.195-.4-.597-.634-.996-.788a5.723 5.723 0 00-.626-.194c-1-.263-2.05-.36-3.077-.416a25.834 25.834 0 00-3.7.062c-.915.083-1.88.184-2.75.5-.318.116-.646.256-.888.501-.297.302-.393.77-.177 1.146.154.267.415.456.692.58.36.162.737.284 1.123.366 1.075.238 2.189.331 3.287.37 1.218.05 2.437.01 3.65-.118.299-.033.598-.073.896-.119.352-.054.578-.513.474-.834-.124-.383-.457-.531-.834-.473-.466.074-.96.108-1.382.146-1.177.08-2.358.082-3.536.006a22.228 22.228 0 01-1.157-.107c-.086-.01-.18-.025-.258-.036-.243-.036-.484-.08-.724-.13-.111-.027-.111-.185 0-.212h.005c.277-.06.557-.108.838-.147h.002c.131-.009.263-.032.394-.048a25.076 25.076 0 013.426-.12c.674.019 1.347.067 2.017.144l.228.031c.267.04.533.088.798.145.392.085.895.113 1.07.542.055.137.08.288.111.431l.319 1.484a.237.237 0 01-.199.284h-.003c-.037.006-.075.01-.112.015a36.704 36.704 0 01-4.743.295 37.059 37.059 0 01-4.699-.304c-.14-.017-.293-.042-.417-.06-.326-.048-.649-.108-.973-.161-.393-.065-.768-.032-1.123.161-.29.16-.527.404-.675.701-.154.316-.199.66-.267 1.001-.069.34-.176.707-.135 1.056.087.753.613 1.365 1.37 1.502a39.69 39.69 0 0011.343.376.483.483 0 01.535.53l-.071.697-1.018 9.907c-.041.41-.047.832-.125 1.237-.122.637-.553 1.028-1.182 1.171-.577.131-1.165.2-1.756.205-.656.004-1.31-.025-1.966-.022-.699.004-1.556-.06-2.095-.58-.475-.458-.54-1.174-.605-1.793l-.731-7.13-.322-3.152c-.037-.36-.351-.634-.708-.618-.339.014-.618.322-.579.694l.318 3.106.907 8.844c.083.808.83 1.6 1.664 1.789.905.204 1.803.238 2.719.243 1.19.007 2.401.007 3.567-.238.85-.178 1.696-.579 2.077-1.412.145-.318.244-.686.312-1.027.09-.457.14-.919.19-1.379l.24-2.2.522-4.789.19-1.751a.237.237 0 01.264-.209c.31.045.63.108.94.16.42.07.844.14 1.267.212 1.24.207 2.454.481 3.685.717.35.067.7.146 1.05.187a.237.237 0 01.208.263l-.174 1.61c-.041.376.207.7.579.72.339.017.626-.247.663-.585l.393-3.625c.017-.16.017-.322-.02-.48z"/></svg>
+        <span>Buy me a coffee</span>
+      </a>
     </div>
   `;
     return panel;
@@ -1038,7 +1108,7 @@ function buildGlobalPanel(debug, {retention, seenBytes}) {
 // ── Impure: tab bar listeners ─────────────────────────────────────────────────
 
 function attachTabBarListeners(el, handlers) {
-    const {onTabClick, onGearClick, onGlobalGearClick, onPlusClick, onInfoToggle} = handlers;
+    const {onTabClick, onGearClick, onGlobalGearClick, onPlusClick, onInfoToggle, onSeenPauseToggle} = handlers;
 
     el.querySelector(".scf-global-gear-link").addEventListener("click", (e) => {
         e.preventDefault();
@@ -1074,6 +1144,14 @@ function attachTabBarListeners(el, handlers) {
         const open = !infoLi.classList.contains("scf-info-open");
         setInfoOpen(infoLi, open);
         onInfoToggle(open);
+    });
+
+    const seenToggle = infoLi.querySelector(".scf-seen-toggle");
+    seenToggle.addEventListener("click", () => {
+        seenToggle.disabled = true;
+        onSeenPauseToggle()
+            .catch(console.error)
+            .finally(() => { seenToggle.disabled = false; });
     });
 }
 
@@ -1125,7 +1203,7 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
         onSave(updatedTab).catch(console.error);
     });
 
-    // filterReposts toggle ↔ segmented control visibility
+    // filterReposts toggle ↔ sub-section visibility
     const frToggle = el.querySelector("#scf-fr-toggle");
     const frSub = el.querySelector("#scf-fr-sub");
     frToggle.addEventListener("change", () => {
@@ -1143,18 +1221,14 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
     }
 
     const frInfoEl = el.querySelector("#scf-fr-info");
-    for (const btn of el.querySelectorAll("#scf-fr-sub .scf-seg-btn")) {
-        btn.addEventListener("click", () => {
-            frInfoEl.textContent = REPOST_INFO[btn.dataset.type] ?? "";
-        });
-    }
+    el.querySelector("#scf-fr-type").addEventListener("change", (e) => {
+        frInfoEl.textContent = REPOST_INFO[e.target.value] ?? "";
+    });
 
     const asSub = el.querySelector("#scf-as-sub");
-    for (const btn of el.querySelectorAll("#scf-as-mode .scf-seg-btn")) {
-        btn.addEventListener("click", () => {
-            asSub.classList.toggle("scf-visible", btn.dataset.mode !== "off");
-        });
-    }
+    el.querySelector("#scf-as-toggle").addEventListener("change", (e) => {
+        asSub.classList.toggle("scf-visible", e.target.checked);
+    });
 
     const countLines = el.querySelectorAll(".scf-seen-count");
     for (const btn of el.querySelectorAll("#scf-as-source .scf-seg-btn")) {
@@ -1187,14 +1261,10 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
     });
 
     // Playlist filter mode segmented buttons
-    const pfModeButtons = el.querySelectorAll(".scf-pf-mode-btn");
     const pfNitRow = el.querySelector("#scf-pf-nit-row");
     const pfNitToggle = el.querySelector("#scf-pf-nit-toggle");
-    for (const btn of pfModeButtons) {
+    for (const btn of el.querySelectorAll("#scf-pf-mode .scf-seg-btn")) {
         btn.addEventListener("click", () => {
-            for (const b of pfModeButtons) {
-                b.classList.toggle("scf-active", b === btn);
-            }
             // nameInTitles is only active with hideLarge — disable the row for other modes
             const isHideLarge = btn.dataset.mode === "hideLarge";
             pfNitRow.classList.toggle("scf-row-disabled", !isHideLarge);
@@ -1211,8 +1281,8 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
     const tlMinLabel = el.querySelector("#scf-tl-min-label");
     const tlMaxLabel = el.querySelector("#scf-tl-max-label");
     dualSlider(el, "tl", 0, (mn, mx) => {
-        tlMinLabel.textContent = mn + " min";
-        tlMaxLabel.textContent = mx + " min";
+        tlMinLabel.textContent = tlLabel(mn);
+        tlMaxLabel.textContent = tlLabel(mx);
     });
 
     // Content age toggle + dual slider
@@ -1234,7 +1304,9 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
     const tfAdd = el.querySelector("#scf-tf-add");
     const chipContainer = el.querySelector("#scf-tag-chips");
     const tagWarning = el.querySelector("#scf-tf-warning");
-    const tfClear = el.querySelector("#scf-tf-clear");
+    const tfClear = document.createElement("button");
+    tfClear.className = "scf-seen-reset scf-tag-clear-btn";
+    tfClear.textContent = "Clear all";
 
     // Local mutable copy of tags for this panel session
     let localTags = [...(tab.type === "settings" ? tab.settings.tagFilter.tags : [])];
@@ -1256,6 +1328,8 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
             chip.appendChild(rm);
             chipContainer.appendChild(chip);
         });
+        chipContainer.appendChild(tfClear);
+        chipContainer.hidden = localTags.length === 0;
         tagWarning.hidden = !(
             tfToggle.checked && localMode === "include" && localTags.length === 0
         );
@@ -1270,14 +1344,10 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
 
     tfInclude.addEventListener("click", () => {
         localMode = "include";
-        tfInclude.classList.add("scf-active");
-        tfExclude.classList.remove("scf-active");
         renderChips();
     });
     tfExclude.addEventListener("click", () => {
         localMode = "exclude";
-        tfExclude.classList.add("scf-active");
-        tfInclude.classList.remove("scf-active");
         renderChips();
     });
 
@@ -1307,8 +1377,7 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
             : sanitizeSettings({});
 
         settings.filterReposts.enabled = el.querySelector("#scf-fr-toggle").checked;
-        const activeSegBtn = el.querySelector("#scf-fr-sub .scf-seg-btn.scf-active");
-        if (activeSegBtn) settings.filterReposts.type = activeSegBtn.dataset.type;
+        settings.filterReposts.type = el.querySelector("#scf-fr-type").value;
 
         settings.trackLengthInMin.enabled = el.querySelector("#scf-tl-toggle").checked;
         settings.trackLengthInMin.min = parseInt(el.querySelector("#scf-tl-min").value, 10);
@@ -1320,11 +1389,11 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
 
         settings.freeDownloadsOnly.enabled = el.querySelector("#scf-fd-toggle").checked;
         settings.alreadySeen = {
-            mode: el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? settings.alreadySeen.mode,
+            mode: el.querySelector("#scf-as-toggle").checked ? "on" : "off",
             source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? settings.alreadySeen.source,
         };
         settings.playlistFilter.enabled = el.querySelector("#scf-pf-toggle").checked;
-        settings.playlistFilter.mode = el.querySelector(".scf-pf-mode-btn.scf-active")?.dataset.mode ?? "hideLarge";
+        settings.playlistFilter.mode = el.querySelector("#scf-pf-mode .scf-seg-btn.scf-active")?.dataset.mode ?? "hideLarge";
         settings.playlistFilter.nameInTitles = el.querySelector("#scf-pf-nit-toggle").checked;
 
         settings.tagFilter.enabled = el.querySelector("#scf-tf-toggle").checked;
@@ -1346,22 +1415,20 @@ function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRe
         onDebugChange(e.target.checked).catch(console.error);
     });
 
-    const seenData = el.querySelector("#scf-seen-data");
+    const seenNum = el.querySelector("#scf-seen-data .scf-seen-num");
+    const clearSeenBtn = el.querySelector("#scf-clear-seen-btn");
     function showSeenBytes(bytes) {
-        seenData.querySelector(".scf-seen-num").textContent = formatBytes(bytes);
-        seenData.querySelector(".scf-seen-reset-wrap").hidden = bytes === 0;
+        seenNum.textContent = formatBytes(bytes);
+        clearSeenBtn.hidden = bytes === 0;
     }
 
-    const retentionButtons = el.querySelectorAll("#scf-seen-retention .scf-seg-btn");
-    for (const btn of retentionButtons) {
-        btn.addEventListener("click", () => {
-            if (btn.classList.contains("scf-active")) return;
-            for (const b of retentionButtons) b.classList.toggle("scf-active", b === btn);
-            onRetentionChange(Number(btn.dataset.months)).then(showSeenBytes).catch(console.error);
-        });
-    }
+    const retentionHelp = el.querySelector("#scf-seen-retention-help");
+    el.querySelector("#scf-seen-retention").addEventListener("change", (e) => {
+        retentionHelp.dataset.tip = retentionTip(Number(e.target.value));
+        onRetentionChange(Number(e.target.value)).then(showSeenBytes).catch(console.error);
+    });
 
-    el.querySelector("#scf-clear-seen-btn").addEventListener("click", () => {
+    clearSeenBtn.addEventListener("click", () => {
         if (!confirm("Forget all seen tracks?")) return;
         onClearAllSeen().then(() => showSeenBytes(0)).catch(console.error);
     });
@@ -1446,16 +1513,19 @@ async function initFilters() {
             }
         },
         onGearClick: async (id) => {
-            const {tabs, activeTabId, debug, seenRetention} = await loadState();
+            const {tabs, seenRetention} = await loadState();
             const tab = tabs.find((t) => t.id === id);
             if (!tab) return;
             await openSettingsPanel(tab, {
                 retention: seenRetention,
-                // onSave uses the panel-open snapshot of tabs/activeTabId intentionally.
-                // The settings panel is modal — no concurrent state changes are possible while it is open.
+                // Save and Delete re-read state: the tab bar stays usable while the panel is open.
                 onSave: async (updatedTab) => {
-                    const newTabs = tabs.map((t) => (t.id === updatedTab.id ? updatedTab : t));
-                    if (updatedTab.id === activeTabId) {
+                    const {tabs, activeTabId, debug} = await loadState();
+                    const stored = tabs.find((t) => t.id === updatedTab.id);
+                    if (!stored) return;
+                    const saved = withStoredPause(updatedTab, stored);
+                    const newTabs = tabs.map((t) => (t.id === saved.id ? saved : t));
+                    if (saved.id === activeTabId) {
                         await saveAndResetFeed(newTabs, activeTabId, debug);
                     } else {
                         await save(newTabs, activeTabId);
@@ -1465,9 +1535,10 @@ async function initFilters() {
                 },
                 // Only pass onDelete when there is more than one tab — attachPanelListeners
                 // hides the Delete button when onDelete is undefined.
-                // tabs.length uses the panel-open snapshot — safe because the panel is modal.
                 onDelete: tabs.length > 1 ? async () => {
                     if (!confirm("Delete this filter?")) return;
+                    const {tabs, activeTabId, debug} = await loadState();
+                    if (tabs.length <= 1 || !tabs.some((t) => t.id === id)) return;
                     const {tabs: newTabs, newActiveId} = tabsAfterDelete(tabs, id);
                     if (id === activeTabId) {
                         await saveAndResetFeed(newTabs, newActiveId, debug);
@@ -1480,7 +1551,7 @@ async function initFilters() {
                     }
                     await clearSeen([seenListIdFor(id, "tab")]);
                 } : undefined,
-                onResetSeen: (listId) => resetSeenList(listId, tabs, activeTabId),
+                onResetSeen: resetSeenList,
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
@@ -1521,7 +1592,7 @@ async function initFilters() {
             });
         },
         onPlusClick: async () => {
-            const {tabs, activeTabId, seenRetention} = await loadState();
+            const {tabs, seenRetention} = await loadState();
             const newTab = {
                 id: crypto.randomUUID(),
                 name: uniqueName("New Filter", tabs.map((t) => t.name)),
@@ -1531,13 +1602,13 @@ async function initFilters() {
             await openSettingsPanel(newTab, {
                 retention: seenRetention,
                 onSave: async (updatedTab) => {
-                    const newTabs = [...tabs, updatedTab];
-                    // NOTE: `await save(...)` is intentional — activeTabId preserved so new tab does not become active automatically.
-                    await save(newTabs, activeTabId);
+                    const {tabs, activeTabId} = await loadState();
+                    // save(), not saveAndResetFeed(): the new tab does not become active.
+                    await save([...tabs, updatedTab], activeTabId);
                     document.getElementById("scf-settings-panel")?.remove();
                     initFilters();
                 },
-                onResetSeen: (listId) => resetSeenList(listId, tabs, activeTabId),
+                onResetSeen: resetSeenList,
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
@@ -1545,6 +1616,12 @@ async function initFilters() {
         },
         onInfoToggle: (open) => {
             browser.storage.sync.set({scfInfoOpen: open}).catch(console.error);
+        },
+        onSeenPauseToggle: async () => {
+            const {tabs, activeTabId, debug} = await loadState();
+            const newTabs = tabsWithSeenPauseToggled(tabs, activeTabId);
+            if (newTabs === tabs) return;
+            await saveAndResetFeed(newTabs, activeTabId, debug);
         },
     });
 

@@ -49,6 +49,10 @@ class FakeCustomEvent {
 // recorded in `events`, and listeners run synchronously like in a browser.
 // `seenResponder(query) → ids` plays content.js: it answers each
 // scf:seen-query with scf:seen-result. Without it, queries go unanswered.
+//
+// The feed is fake too: render(href) adds a link the way SoundCloud renders an
+// item (seen by the MutationObserver), show(href) scrolls it on screen (fires
+// the IntersectionObserver). Like the real one, it batches entries per tick.
 function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
     class FakeXHR {}
     FakeXHR.prototype.open = function () {};
@@ -57,6 +61,43 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
 
     const warnings = [];
     const events = [];
+    const links = [];
+    const feedList = {
+        nodeType: 1,
+        closest: (selector) => (selector === ".stream__list" ? feedList : null),
+        matches: () => false,
+        querySelectorAll: (selector) => (selector === "a[href]" ? links.filter((l) => l.inFeed) : []),
+    };
+    const watched = new Set();
+    let intersect = null;
+    let mutate = null;
+    let feedWatched = false;
+    let queued = [];
+    function queueIntersection(link) {
+        if (queued.length === 0) {
+            Promise.resolve().then(() => {
+                const entries = queued.map((target) => ({target, isIntersecting: true}));
+                queued = [];
+                intersect(entries);
+            });
+        }
+        queued.push(link);
+    }
+    class FakeIntersectionObserver {
+        constructor(callback) { intersect = callback; }
+        observe(link) {
+            if (watched.has(link)) return;
+            watched.add(link);
+            if (link.visible) queueIntersection(link);
+        }
+        unobserve(link) { watched.delete(link); }
+        disconnect() { watched.clear(); }
+    }
+    class FakeMutationObserver {
+        constructor(callback) { mutate = callback; }
+        observe() { feedWatched = true; }
+        disconnect() { feedWatched = false; }
+    }
     const listeners = new Map();
     const document = {
         cookie,
@@ -77,6 +118,7 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
         // The response handler updates the skip-info spinner text on every
         // page (scfUpdateSkipInfo); without this stub that throws and the
         // pass-through catch returns the response unfiltered.
+        querySelector: (selector) => (selector === ".stream__list" ? feedList : null),
         querySelectorAll: () => [],
     };
     if (seenResponder) {
@@ -96,6 +138,8 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
         setTimeout,
         clearTimeout,
         window: {},
+        IntersectionObserver: FakeIntersectionObserver,
+        MutationObserver: FakeMutationObserver,
         document,
         CustomEvent: FakeCustomEvent,
         XMLHttpRequest: FakeXHR,
@@ -103,7 +147,31 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
     if (fetch) sandbox.fetch = fetch;
     vm.createContext(sandbox);
     vm.runInContext(filterSource, sandbox);
-    return {sandbox, warnings, events, XHR: FakeXHR};
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    // inFeed: false is a link elsewhere on the page, e.g. the player bar.
+    async function render(href, {visible = false, inFeed = true} = {}) {
+        const link = {
+            nodeType: 1,
+            href,
+            pathname: new URL(href, "https://soundcloud.com").pathname,
+            visible,
+            inFeed,
+            closest: (selector) => (selector === ".stream__list" && inFeed ? feedList : null),
+            matches: (selector) => selector === "a[href]",
+            querySelectorAll: () => [],
+        };
+        links.push(link);
+        if (feedWatched) mutate([{addedNodes: [link]}]);
+        await tick();
+    }
+    async function show(href) {
+        for (const link of links.filter((l) => l.href === href)) {
+            link.visible = true;
+            if (watched.has(link)) queueIntersection(link);
+        }
+        await tick();
+    }
+    return {sandbox, warnings, events, render, show, tick, XHR: FakeXHR};
 }
 
 // Returns the parsed details of every recorded event of `type`.
@@ -140,11 +208,13 @@ function seenConfig(mode, source = "tab") {
 
 const ids = (out) => out.collection.map((item) => item.track?.id ?? "playlist");
 
+const trackUrl = (id) => `https://soundcloud.com/artist${id}/track-${id}`;
+
 function track(id, ageDays, extra = {}) {
     return {
         type: "track",
         created_at: daysAgo(ageDays),
-        track: {id, title: `track ${id}`, duration: 180000, created_at: daysAgo(ageDays), user_id: 100 + id, ...extra},
+        track: {id, title: `track ${id}`, duration: 180000, created_at: daysAgo(ageDays), user_id: 100 + id, permalink_url: trackUrl(id), ...extra},
     };
 }
 
@@ -259,11 +329,55 @@ async function seenOnHidesDuplicateInSamePage() {
     assert.deepStrictEqual(ids(out), [1, 2], "second occurrence of track 1 in the same page is removed");
 }
 
-async function seenOnReportsShownIds() {
+async function seenRecordedOnlyOnceOnScreen() {
     const bits = loadFilter({config: seenConfig("on"), seenResponder: () => [2]});
     await runStream(bits, {collection: [track(1, 1), track(2, 1), track(3, 1)]});
-    const reports = eventDetails(bits, "scf:seen");
-    assert.deepStrictEqual(reports, [{tabId: "t1", ids: [1, 3]}], "reports exactly the shown track ids");
+    assert.strictEqual(eventDetails(bits, "scf:seen").length, 0, "loading a page records nothing");
+
+    await bits.render("/artist1/track-1", {visible: true});
+    await bits.render("/artist3/track-3");
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}], "only the on-screen track is recorded");
+
+    await bits.show("/artist3/track-3");
+    await bits.show("/artist3/track-3");
+    assert.deepStrictEqual(
+        eventDetails(bits, "scf:seen"),
+        [{tabId: "t1", ids: [1]}, {tabId: "t1", ids: [3]}],
+        "each track is recorded once, when it scrolls on screen"
+    );
+}
+
+async function seenPicksUpLinksRenderedBeforeResponse() {
+    const bits = loadFilter({config: seenConfig("on"), seenResponder: () => []});
+    await bits.render("/artist1/track-1", {visible: true});
+    await runStream(bits, {collection: [track(1, 1)]});
+    await bits.tick();
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}]);
+}
+
+async function seenIgnoresLinksOutsideTheFeed() {
+    const bits = loadFilter({config: seenConfig("on"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1)]});
+    await bits.render("/artist1/track-1", {visible: true, inFeed: false});
+    assert.strictEqual(eventDetails(bits, "scf:seen").length, 0, "nothing is recorded away from the feed");
+}
+
+async function seenSingleTrackPlaylistUsesPlaylistLink() {
+    const single = playlistRepost(1);
+    single.playlist.track_count = 1;
+    single.playlist.tracks = [single.playlist.tracks[0]];
+    single.playlist.permalink_url = "https://soundcloud.com/someone/sets/single";
+    const bits = loadFilter({config: seenConfig("paused")});
+    await runStream(bits, {collection: [single]});
+    await bits.render("https://soundcloud.com/someone/sets/single?in=x", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [901]}]);
+}
+
+async function seenOnHidesRepeatOfTrackNotYetOnScreen() {
+    const bits = loadFilter({config: seenConfig("on"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1)]});
+    const out = await runStream(bits, {collection: [track(1, 2), track(2, 2)]});
+    assert.deepStrictEqual(ids(out), [2], "a track already shown in this feed is not shown again");
 }
 
 async function seenOffSendsNoQueryOrReport() {
@@ -271,6 +385,7 @@ async function seenOffSendsNoQueryOrReport() {
     const out = await runStream(bits, {collection: [track(1, 1), track(1, 2)]});
     assert.deepStrictEqual(ids(out), [1, 1], "nothing is hidden as seen when off");
     assert.strictEqual(eventDetails(bits, "scf:seen-query").length, 0, "no query when off");
+    await bits.render("/artist1/track-1", {visible: true});
     assert.strictEqual(eventDetails(bits, "scf:seen").length, 0, "no report when off");
 }
 
@@ -279,10 +394,14 @@ async function seenPausedRecordsWithoutHiding() {
     const out = await runStream(bits, {collection: [track(1, 1), track(2, 1), track(1, 2)]});
     assert.deepStrictEqual(ids(out), [1, 2, 1], "nothing is hidden as seen when paused");
     assert.strictEqual(eventDetails(bits, "scf:seen-query").length, 0, "no query when paused");
+    await bits.render("/artist1/track-1");
+    await bits.render("/artist2/track-2");
+    await bits.show("/artist1/track-1");
+    await bits.show("/artist2/track-2");
     assert.deepStrictEqual(
         eventDetails(bits, "scf:seen"),
-        [{tabId: "t1", ids: [1, 2]}],
-        "shown ids are still reported when paused"
+        [{tabId: "t1", ids: [1]}, {tabId: "t1", ids: [2]}],
+        "on-screen ids are still reported when paused"
     );
 }
 
@@ -323,6 +442,18 @@ async function statsReportedAfterResponse() {
     );
 }
 
+async function trackLengthMaxAtSliderEndHasNoUpperLimit() {
+    const config = {
+        type: "settings",
+        settings: defaultSettings({trackLengthInMin: {enabled: true, min: 45, max: 120}}),
+        debug: false,
+    };
+    const bits = loadFilter({config});
+    const minutes = (n) => ({duration: n * 60000});
+    const out = await runStream(bits, {collection: [track(1, 1, minutes(30)), track(2, 1, minutes(90)), track(3, 1, minutes(240))]});
+    assert.deepStrictEqual(ids(out), [2, 3], "a 120 max shown as \"120+ min\" keeps tracks longer than 120 min");
+}
+
 (async () => {
     const tests = [
         stopsPaginationWhenPageReachesAgeCap,
@@ -332,12 +463,17 @@ async function statsReportedAfterResponse() {
         freeDownloadMatchesLabelVariants,
         seenOnHidesQueriedIds,
         seenOnHidesDuplicateInSamePage,
-        seenOnReportsShownIds,
+        seenRecordedOnlyOnceOnScreen,
+        seenPicksUpLinksRenderedBeforeResponse,
+        seenIgnoresLinksOutsideTheFeed,
+        seenSingleTrackPlaylistUsesPlaylistLink,
+        seenOnHidesRepeatOfTrackNotYetOnScreen,
         seenOffSendsNoQueryOrReport,
         seenPausedRecordsWithoutHiding,
         seenQueryCarriesSource,
         seenQueryTimeoutFallsBack,
         statsReportedAfterResponse,
+        trackLengthMaxAtSliderEndHasNoUpperLimit,
     ];
     let failed = 0;
     for (const t of tests) {
