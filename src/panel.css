@@ -307,6 +307,7 @@ body.theme-light {
 }
 .scf-sub-section.scf-visible { display: flex; }
 #scf-as-sub { gap: 6px; }
+.scf-seen-counts { gap: 0; }
 .scf-seen-count {
   font-size: 11px;
   line-height: 1.6;
@@ -541,10 +542,6 @@ body.theme-light {
 .scf-btn-sm { padding: 4px 10px; }
 
 /* Global panel body */
-#scf-global-panel .scf-seen-bytes {
-  color: var(--scf-text-muted);
-  font-variant-numeric: tabular-nums;
-}
 #scf-global-panel .scf-row .scf-seen-reset { font-size: 12px; }
 #scf-global-panel .scf-global-links {
   display: flex;

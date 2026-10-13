@@ -39,9 +39,7 @@ Firefox: https://addons.mozilla.org/en-GB/firefox/addon/soundcloud-feedfilter-ex
 Click the ⓘ icon at the end of the tab bar to show live stats next to it:
 
 - **Seen** — how many tracks have been seen in all tabs and in the active tab; the list the active tab hides against is highlighted
-- **Filtered** — how many feed items the active tab has hidden since the feed was last loaded, out of how many it checked
-
-Click ⓘ again to hide them. The extension remembers whether the stats are shown.
+- **Skipped** — how many feed items the active tab has hidden since the feed was last loaded, out of how many it checked
 
 ## Filters
 
@@ -72,3 +70,5 @@ The extension ships with these pre-configured tabs:
 This extension is based/inspired on these extensions:
 - [SoundCloud Feed Filter](https://github.com/7x11x13/sc-filter) by [7x11x13](https://github.com/7x11x13).
 - [SoundCloud repost blocker](https://github.com/apsun/sc-repost-blocker) by [apsun](https://github.com/apsun).
+
+The gear in the extension icon is the "settings" icon from [Lucide](https://lucide.dev) ([ISC License](https://lucide.dev/license)).

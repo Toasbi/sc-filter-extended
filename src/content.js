@@ -613,6 +613,11 @@ function seenBytes() {
     });
 }
 
+async function seenSummary(tabId) {
+    const [tab, all, bytes] = await Promise.all([seenCount(seenListIdFor(tabId, "tab")), seenCount("all"), seenBytes()]);
+    return {tab, all, bytes};
+}
+
 // Clears a list and rebuilds the feed only if the active tab currently hides against it.
 async function resetSeenList(listId) {
     await clearSeen([listId]);
@@ -1046,10 +1051,16 @@ function buildSettingsPanel(tab, {counts, retention}) {
               <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">Any tab</button>
             </div>
           </div>
-          <div>
-            ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
-            ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
-          </div>
+        </div>
+      </div>
+
+      <div class="scf-group">
+        <div class="scf-row">
+          <span class="scf-row-label">Seen tracks</span>
+        </div>
+        <div class="scf-sub-section scf-visible scf-seen-counts">
+          ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
+          ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
         </div>
       </div>
     </div>
@@ -1065,7 +1076,7 @@ function buildSettingsPanel(tab, {counts, retention}) {
     return panel;
 }
 
-function buildGlobalPanel(debug, {retention, seenBytes}) {
+function buildGlobalPanel(debug, {retention, activeTab, seen}) {
     const panel = document.createElement("div");
     panel.id = "scf-global-panel";
     panel.innerHTML = `
@@ -1078,9 +1089,15 @@ function buildGlobalPanel(debug, {retention, seenBytes}) {
         <span class="scf-row-label">Remember seen tracks <span class="scf-help" id="scf-seen-retention-help" data-tip="${retentionTip(retention)}">?</span></span>
         ${selectHtml("scf-seen-retention", SEEN_RETENTION_LABELS, retention)}
       </div>
-      <div class="scf-row" id="scf-seen-data">
-        <span class="scf-row-label">Seen data <span class="scf-seen-bytes">· <span class="scf-seen-num">${formatBytes(seenBytes)}</span></span></span>
-        <button class="scf-seen-reset" id="scf-clear-seen-btn"${seenBytes === 0 ? " hidden" : ""}>Clear all</button>
+      <div class="scf-group" id="scf-seen-data">
+        <div class="scf-row">
+          <span class="scf-row-label">Seen tracks</span>
+          <button class="scf-seen-reset" id="scf-clear-seen-btn"${seen.bytes === 0 ? " hidden" : ""}>Clear all</button>
+        </div>
+        <div class="scf-sub-section scf-visible scf-seen-counts">
+          <div class="scf-seen-count"><span class="scf-seen-tab-name"></span>: <span class="scf-seen-num" data-count="tab">${formatCount(seen.tab)}</span> seen</div>
+          <div class="scf-seen-count">All tabs: <span class="scf-seen-num" data-count="all">${formatCount(seen.all)}</span> seen · <span class="scf-seen-num" data-count="bytes">${formatBytes(seen.bytes)}</span></div>
+        </div>
       </div>
       <div class="scf-row">
         <span class="scf-row-label">Debug logging <span class="scf-help" data-tip="Logs each feed item and why it was shown or filtered to the browser console (DevTools → Console).">?</span></span>
@@ -1102,6 +1119,8 @@ function buildGlobalPanel(debug, {retention, seenBytes}) {
       </a>
     </div>
   `;
+    // textContent: tab names are user input.
+    panel.querySelector(".scf-seen-tab-name").textContent = activeTab.name;
     return panel;
 }
 
@@ -1415,22 +1434,24 @@ function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRe
         onDebugChange(e.target.checked).catch(console.error);
     });
 
-    const seenNum = el.querySelector("#scf-seen-data .scf-seen-num");
     const clearSeenBtn = el.querySelector("#scf-clear-seen-btn");
-    function showSeenBytes(bytes) {
-        seenNum.textContent = formatBytes(bytes);
-        clearSeenBtn.hidden = bytes === 0;
+    function showSeen(seen) {
+        for (const num of el.querySelectorAll("#scf-seen-data .scf-seen-num")) {
+            const {count} = num.dataset;
+            num.textContent = count === "bytes" ? formatBytes(seen.bytes) : formatCount(seen[count]);
+        }
+        clearSeenBtn.hidden = seen.bytes === 0;
     }
 
     const retentionHelp = el.querySelector("#scf-seen-retention-help");
     el.querySelector("#scf-seen-retention").addEventListener("change", (e) => {
         retentionHelp.dataset.tip = retentionTip(Number(e.target.value));
-        onRetentionChange(Number(e.target.value)).then(showSeenBytes).catch(console.error);
+        onRetentionChange(Number(e.target.value)).then(showSeen).catch(console.error);
     });
 
     clearSeenBtn.addEventListener("click", () => {
         if (!confirm("Forget all seen tracks?")) return;
-        onClearAllSeen().then(() => showSeenBytes(0)).catch(console.error);
+        onClearAllSeen().then(() => showSeen({tab: 0, all: 0, bytes: 0})).catch(console.error);
     });
 }
 
@@ -1448,10 +1469,10 @@ async function openSettingsPanel(tab, handlers) {
 }
 
 async function openGlobalPanel(handlers) {
-    const bytes = await seenBytes();
+    const seen = await seenSummary(handlers.activeTab.id);
     document.getElementById("scf-global-panel")?.remove();
     document.getElementById("scf-settings-panel")?.remove();
-    const el = buildGlobalPanel(handlers.debug, {retention: handlers.retention, seenBytes: bytes});
+    const el = buildGlobalPanel(handlers.debug, {retention: handlers.retention, activeTab: handlers.activeTab, seen});
     attachGlobalPanelListeners(el, handlers);
     attachTooltipListeners(el);
     document.body.appendChild(el);
@@ -1558,10 +1579,12 @@ async function initFilters() {
             });
         },
         onGlobalGearClick: async () => {
-            let {debug, seenRetention} = await loadState();
+            let {tabs, activeTabId, debug, seenRetention} = await loadState();
+            const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
             await openGlobalPanel({
                 debug,
                 retention: seenRetention,
+                activeTab,
                 onRestore: async () => {
                     const defaults = buildDefaultTabs();
                     await clearSeen(null);
@@ -1579,7 +1602,7 @@ async function initFilters() {
                 onRetentionChange: async (months) => {
                     await browser.storage.sync.set({scfSeenRetention: months});
                     await pruneSeen(months);
-                    return seenBytes();
+                    return seenSummary(activeTab.id);
                 },
                 onClearAllSeen: async () => {
                     await clearSeen(null);
