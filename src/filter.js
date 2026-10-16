@@ -131,17 +131,36 @@ function trackIdsIn(collection) {
     return [...ids];
 }
 
+// What a response hides from the user's history: {hides, ids, playlistRule}.
+// hides is "seen", "played" or null; ids starts as content.js's scf:seen-result
+// answer and, under "seen" only, also collects what the response shows.
+function noHistory() {
+    return {hides: null, ids: new Set(), playlistRule: "any"};
+}
+
+function historyCheckName(history) {
+    return history.hides === "played" ? "alreadyPlayed" : "alreadySeen";
+}
+
+// Under "any" the playlist's own id also counts: it is recorded when a track is played from it.
+function isPlaylistPlayed(playlist, playedIds, rule) {
+    const trackIds = (Array.isArray(playlist.tracks) ? playlist.tracks : [])
+        .map((t) => t?.id)
+        .filter((id) => id != null);
+    if (rule === "all") return trackIds.length > 0 && trackIds.every((id) => playedIds.has(id));
+    return playedIds.has(playlistSeenId(playlist)) || trackIds.some((id) => playedIds.has(id));
+}
+
 // Returns true if the track should be removed.
-// Pure: never mutates seenIds. Caller adds id to seenIds when item passes.
-// seenIds is the per-response set built from content.js's scf:seen-result answer.
+// Pure: never mutates history. Caller adds the id to history.ids when the item passes.
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
-function shouldFilterTrack(track, settings, seenIds, debug) {
-    if (settings.alreadySeen?.mode === "on") {
-        if (seenIds.has(track.id)) {
-            if (debug) debug.checks.push("alreadySeen ✗ filtered");
+function shouldFilterTrack(track, settings, history, debug) {
+    if (history.hides !== null) {
+        if (history.ids.has(track.id)) {
+            if (debug) debug.checks.push(`${historyCheckName(history)} ✗ filtered`);
             return true;
         }
-        if (debug) debug.checks.push("alreadySeen ✓");
+        if (debug) debug.checks.push(`${historyCheckName(history)} ✓`);
     }
     if (settings.trackLengthInMin.enabled) {
         const minutes = Math.min(track.duration / 60000, 120);
@@ -173,7 +192,7 @@ function shouldFilterTrack(track, settings, seenIds, debug) {
 // shown: {ids, path, title} entries recorded as seen once on screen; a passing
 // playlist pushes its seen-list ids under the playlist's link.
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
-function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
+function shouldFilterPlaylist(playlist, settings, history, shown, debug) {
     // hideAll is enforced server-side via the activityTypes rewrite, but
     // playlist reposts can still arrive (the rewrite only strips PlaylistPost)
     // — remove any playlist that reaches here.
@@ -182,9 +201,16 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
         return true;
     }
     const playlistId = playlistSeenId(playlist);
-    if (settings.alreadySeen?.mode === "on" && seenIds.has(playlistId)) {
+    if (history.hides === "seen" && history.ids.has(playlistId)) {
         if (debug) debug.checks.push("alreadySeen ✗ playlist filtered");
         return true;
+    }
+    if (history.hides === "played") {
+        if (isPlaylistPlayed(playlist, history.ids, history.playlistRule)) {
+            if (debug) debug.checks.push(`alreadyPlayed ✗ playlist filtered (${history.playlistRule})`);
+            return true;
+        }
+        if (debug) debug.checks.push(`alreadyPlayed ✓ playlist (${history.playlistRule})`);
     }
     const tracks = playlist.tracks;
     if (!tracks || tracks.length === 0) return false;
@@ -210,9 +236,11 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
         if (debug) debug.checks.push(`playlistFilter ✓ not large (${loadedTracks.length}/${playlist.track_count})`);
     }
 
+    // Under "played" the playlist rule alone decides; its tracks aren't hidden one by one.
+    const trackHistory = history.hides === "played" ? noHistory() : history;
     const passingTracks = loadedTracks.filter((t) => {
         const trackDebug = debug ? {checks: []} : null;
-        const filtered = shouldFilterTrack(t, settings, seenIds, trackDebug);
+        const filtered = shouldFilterTrack(t, settings, trackHistory, trackDebug);
         if (debug) console.log(`[SCF]   track-in-playlist ${filtered ? "FILTERED" : "SHOWN"} "${t.title}" — ${trackDebug.checks.join(" | ")}`);
         return !filtered;
     });
@@ -235,17 +263,17 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
     // A single-track playlist stands for its track; longer ones only for themselves.
     const seenAs = tracks.length === 1 ? [playlistId, tracks[0].id] : [playlistId];
     const ids = seenAs.filter((id) => id != null);
-    for (const id of ids) seenIds.add(id);
+    if (history.hides === "seen") for (const id of ids) history.ids.add(id);
     shown.push({ids, path: permalinkPath(playlist.permalink_url), title: playlist.title});
     return false;
 }
 
 // Returns true if item should be removed from the feed.
-// seenIds (the per-response set) and shown (the entries recorded as seen once
-// on screen) are mutated in two places: here (when a track passes) and inside
+// history.ids (under "seen") and shown (the entries recorded as seen once on
+// screen) are mutated in two places: here (when a track passes) and inside
 // shouldFilterPlaylist (a passing playlist marks itself seen directly).
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
-function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) {
+function shouldFilterItem(item, settings, followingData, history, shown, debug) {
     // Feed age filter (all types)
     if (settings.contentAgeInDays.enabled && settings.contentAgeInDays.min !== null) {
         const age = daysSince(item.created_at);
@@ -341,16 +369,16 @@ function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) 
 
     // Per-type content filters
     if (item.type === "track" || item.type === "track-repost") {
-        const filtered = shouldFilterTrack(item.track, settings, seenIds, debug);
+        const filtered = shouldFilterTrack(item.track, settings, history, debug);
         if (!filtered) {
-            seenIds.add(item.track.id);
+            if (history.hides === "seen") history.ids.add(item.track.id);
             shown.push({ids: [item.track.id], path: permalinkPath(item.track.permalink_url), title: item.track.title});
         }
         return filtered;
     }
 
     if (item.type === "playlist" || item.type === "playlist-repost") {
-        return shouldFilterPlaylist(item.playlist, settings, seenIds, shown, debug);
+        return shouldFilterPlaylist(item.playlist, settings, history, shown, debug);
     }
 
     return false;
@@ -368,6 +396,81 @@ function applyDeepCutsFilter(item) {
         content.playback_count <
         5000 / (1 + Math.exp(-(daysOld + 50) / 1500)) - 2500;
     return userIsNotPopular || fewPlays;
+}
+
+// ── Pure: seen & played ───────────────────────────────────────────────────────
+
+function seenModeOf(cfg) {
+    if (!cfg || cfg.type === "deepCuts") return "off";
+    const mode = cfg.settings?.alreadySeen?.mode;
+    return mode === "seen" || mode === "played" ? mode : "off";
+}
+
+// The history a tab hides right now ("seen" | "played"), or null when off or paused.
+function hiddenHistoryOf(cfg) {
+    const mode = seenModeOf(cfg);
+    return mode === "off" || cfg.settings.alreadySeen.paused === true ? null : mode;
+}
+
+function isPlayHistoryPost(method, url) {
+    if (typeof method !== "string" || method.toUpperCase() !== "POST" || typeof url !== "string") return false;
+    try {
+        const parsed = new URL(url);
+        return parsed.hostname === "api-v2.soundcloud.com" &&
+            parsed.pathname.replace(/\/+$/, "") === "/me/play-history";
+    } catch (_e) {
+        return false;
+    }
+}
+
+function urnId(urn, kind) {
+    const match = typeof urn === "string" ? urn.match(/^soundcloud:([a-z-]+):(\d+)$/) : null;
+    if (!match || match[1] !== kind) return null;
+    const id = Number(match[2]);
+    return Number.isSafeInteger(id) ? id : null;
+}
+
+// SoundCloud's play-history body, e.g. {"context_urn":"soundcloud:playlists:1","track_urn":"soundcloud:tracks:2"}.
+// Returns {trackId, playlistId} (playlistId null without a playlist context), or null.
+function parsePlayHistoryBody(body) {
+    if (typeof body !== "string") return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(body);
+    } catch (_e) {
+        return null;
+    }
+    const trackId = urnId(parsed?.track_urn, "tracks");
+    if (trackId === null) return null;
+    return {trackId, playlistId: urnId(parsed.context_urn, "playlists")};
+}
+
+function playedIdsOf({trackId, playlistId}) {
+    return playlistId === null ? [trackId] : [trackId, -playlistId];
+}
+
+// SoundCloud posts a play after 1 s of playback, so listening starts at 1.
+function startListen(player, threshold) {
+    return {path: player.path, position: player.position, now: player.now, listened: 1, threshold, status: "listening"};
+}
+
+// Advances a listen by one player sample ({path, position, duration, playing, now},
+// or null when the player bar is gone). Samples can be far apart in a background
+// tab, so an advance counts up to the wall time elapsed (+1 s); a bigger jump is
+// a seek. A track shorter than the threshold counts once played to its last second.
+function listenStep(state, sample) {
+    if (sample === null || sample.path !== state.path) return {...state, status: "dropped"};
+    const advanced = sample.position - state.position;
+    const elapsed = (sample.now - state.now) / 1000;
+    const listened = state.listened + (sample.playing && advanced > 0 && advanced <= elapsed + 1 ? advanced : 0);
+    const target = sample.duration > 0 ? Math.min(state.threshold, sample.duration - 1) : state.threshold;
+    return {
+        ...state,
+        position: Number.isFinite(sample.position) ? sample.position : state.position,
+        now: sample.now,
+        listened,
+        status: listened >= target ? "done" : "listening",
+    };
 }
 
 // ── XHR intercept ─────────────────────────────────────────────────────────────
@@ -631,17 +734,10 @@ var SEEN_QUERY_TIMEOUT_MS = 3000;
 var CONFIG_WAIT_MS = 3000;
 let scfSeenReqId = 0;
 
-// Resolves the "Hide seen tracks" mode of a tab config. deepCuts tabs (and a
-// missing config) never take part in seen tracking.
-function seenModeOf(cfg) {
-    if (!cfg || cfg.type === "deepCuts") return "off";
-    const mode = cfg.settings?.alreadySeen?.mode;
-    return mode === "on" || mode === "paused" ? mode : "off";
-}
-
-// Asks content.js which of `ids` are in the hide-source list of tab `tabId`.
-// Resolves to a fresh Set of seen ids; resolves to an empty Set on timeout.
-function querySeen(tabId, source, ids) {
+// Asks content.js which of `ids` are in tab `tabId`'s `list` ("seen" | "played")
+// of scope `source` ("tab" | "all"). Resolves to a fresh Set of matching ids;
+// resolves to an empty Set on timeout.
+function querySeen(tabId, list, source, ids) {
     const reqId = ++scfSeenReqId;
     return new Promise((resolve) => {
         const timer = setTimeout(() => done([]), SEEN_QUERY_TIMEOUT_MS);
@@ -661,7 +757,7 @@ function querySeen(tabId, source, ids) {
         }
         document.addEventListener("scf:seen-result", onResult);
         document.dispatchEvent(new CustomEvent("scf:seen-query", {
-            detail: JSON.stringify({reqId, tabId, source, ids}),
+            detail: JSON.stringify({reqId, tabId, list, source, ids}),
         }));
     });
 }
@@ -674,6 +770,29 @@ function reportSeen(tabId, ids) {
     }));
 }
 
+// tabId is null before the first config and on non-settings tabs, which never hide by
+// history; the shared lists are recorded anyway.
+function reportPlayed(tabId, ids) {
+    document.dispatchEvent(new CustomEvent("scf:played", {
+        detail: JSON.stringify({tabId, ids}),
+    }));
+}
+
+// ── Impure: player bar ───────────────────────────────────────────────────────
+
+function readPlayer() {
+    const link = document.querySelector(".playbackSoundBadge__titleLink");
+    const progress = document.querySelector(".playbackTimeline__progressWrapper");
+    if (!link || !progress) return null;
+    return {
+        path: permalinkPath(link.getAttribute("href")),
+        position: parseInt(progress.getAttribute("aria-valuenow"), 10),
+        duration: parseInt(progress.getAttribute("aria-valuemax"), 10),
+        playing: document.querySelector(".playControl")?.classList.contains("playing") === true,
+        now: Date.now(),
+    };
+}
+
 (function () {
     // Skip counters for the loading-spinner info text; reset on every feed reset.
     let scfSkipped = 0; // items hidden by the active filter in this feed view
@@ -681,7 +800,7 @@ function reportSeen(tabId, ids) {
     // Shown tracks count as seen once their feed link is on screen, not when
     // their page loads. Both are cleared on every feed reset.
     const scfUnseen = new Map(); // link path → {tabId, ids, title}
-    const scfShownInView = new Set(); // hides repeats of not-yet-seen tracks under "on"
+    const scfShownInView = new Set(); // hides repeats of not-yet-seen tracks under "seen"
     // Mutable: re-read from the dataset on every scf:apply-config event.
     let config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
     // Start fetching followings immediately — no await here is intentional.
@@ -797,6 +916,40 @@ function reportSeen(tabId, ids) {
         });
     }
 
+    function scfRecordPlay(ids) {
+        const cfg = config;
+        reportPlayed(cfg?.type === "settings" ? cfg.id : null, ids);
+        if (cfg?.debug) console.log(`[SCF] played ${ids.join(", ")}`);
+    }
+
+    // One listen at a time: a new play replaces the pending one.
+    let scfListenTimer = null;
+    function scfOnPlay(play) {
+        clearInterval(scfListenTimer);
+        scfListenTimer = null;
+        const ids = playedIdsOf(play);
+        const threshold = config?.playedThreshold > 0 ? config.playedThreshold : 0;
+        const player = threshold > 0 ? readPlayer() : null;
+        // Without a readable player bar, count the play now rather than never.
+        if (player === null) {
+            scfRecordPlay(ids);
+            return;
+        }
+        let listen = startListen(player, threshold);
+        const timer = setInterval(() => {
+            try {
+                listen = listenStep(listen, readPlayer());
+            } catch (_e) {
+                listen = {...listen, status: "dropped"};
+            }
+            if (listen.status === "listening") return;
+            clearInterval(timer);
+            if (scfListenTimer === timer) scfListenTimer = null;
+            if (listen.status === "done") scfRecordPlay(ids);
+        }, 1000);
+        scfListenTimer = timer;
+    }
+
     // Capture the request URL in open() so it is available in send().
     // open() always precedes send() in the XHR lifecycle.
     const open = XMLHttpRequest.prototype.open;
@@ -804,6 +957,7 @@ function reportSeen(tabId, ids) {
         if (url.startsWith("https://api-v2.soundcloud.com/stream?") && config) {
             url = applyActivityTypeFilter(url, config);
         }
+        this._scf_method = method;
         this._scf_url = url;
         return open.call(this, method, url, ...args);
     };
@@ -831,14 +985,14 @@ function reportSeen(tabId, ids) {
                 // seen report all use the same tab.
                 const cfg = config;
                 const seenMode = seenModeOf(cfg);
-                // Only "on" hides seen tracks, so only "on" needs to ask content.js.
+                const hides = hiddenHistoryOf(cfg);
                 // querySeen never rejects (timeout → empty Set).
                 let seenPromise = Promise.resolve(new Set());
-                if (seenMode === "on") {
+                if (hides !== null) {
                     try {
                         const ids = trackIdsIn(JSON.parse(xhr.responseText).collection);
                         if (ids.length > 0) {
-                            seenPromise = querySeen(cfg.id, cfg.settings.alreadySeen.source, ids);
+                            seenPromise = querySeen(cfg.id, hides, cfg.settings.alreadySeen.source, ids);
                         }
                     } catch (_e) {
                         // Unparseable response — the handler below passes it through.
@@ -847,9 +1001,10 @@ function reportSeen(tabId, ids) {
                 Promise.all([followings, seenPromise]).then(([followingData, seen]) => {
                     try {
                         if (cfg) {
-                            if (seenMode === "on") {
+                            if (hides === "seen") {
                                 for (const id of scfShownInView) seen.add(id);
                             }
+                            const history = {hides, ids: seen, playlistRule: cfg.playlistPlayedRule === "all" ? "all" : "any"};
                             const responseData = JSON.parse(xhr.responseText);
                             // The stop check must see the raw page: items that survive
                             // filtering always satisfy the age cap, so the filtered
@@ -864,7 +1019,7 @@ function reportSeen(tabId, ids) {
                                     return passes;
                                 }
                                 const debug = cfg.debug ? {checks: []} : null;
-                                const remove = shouldFilterItem(item, cfg.settings, followingData, seen, shown, debug);
+                                const remove = shouldFilterItem(item, cfg.settings, followingData, history, shown, debug);
                                 if (cfg.debug) console.log(`[SCF] ${remove ? "FILTERED" : "SHOWN"} [${item.type}] "${label}" — ${debug.checks.join(" | ")}`);
                                 return !remove;
                             });
@@ -880,11 +1035,11 @@ function reportSeen(tabId, ids) {
                             }
                             Object.defineProperty(xhr, "responseText", {value: JSON.stringify(responseData), configurable: true});
 
-                            // On and Paused record what gets on screen; Off records nothing.
+                            // Every mode but Off records what gets on screen, paused or not.
                             if (seenMode !== "off") {
                                 const unlinked = [];
                                 for (const {ids, path, title} of shown) {
-                                    if (seenMode === "on") ids.forEach((id) => scfShownInView.add(id));
+                                    if (hides === "seen") ids.forEach((id) => scfShownInView.add(id));
                                     if (path) scfUnseen.set(path, {tabId: cfg.id, ids, title});
                                     else unlinked.push(...ids);
                                 }
@@ -907,6 +1062,12 @@ function reportSeen(tabId, ids) {
             };
         }
         send.call(this, data);
+        try {
+            const play = isPlayHistoryPost(this._scf_method, this._scf_url) ? parsePlayHistoryBody(data) : null;
+            if (play) scfOnPlay(play);
+        } catch (e) {
+            if (config?.debug) console.warn("[SCF] play not recorded:", e);
+        }
     };
 
     // Config updates from content.js. "update-only" swaps the config used for

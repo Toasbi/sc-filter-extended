@@ -10,19 +10,29 @@ const DEFAULT_SETTINGS = {
     trackLengthInMin: {enabled: false, min: 0, max: 30},
     contentAgeInDays: {enabled: false, min: null, max: null},
     freeDownloadsOnly: {enabled: false},
-    // mode: "on" (record + hide) | "paused" (record only) | "off" (nothing)
-    // source: which seen list to hide against — "tab" (own list) | "all" (shared list)
-    alreadySeen: {mode: "on", source: "tab"},
+    // mode: what to hide — "off" | "played" | "seen"; every mode but "off" records seen tracks.
+    // paused: record without hiding. source: whose history to hide — "tab" (this tab's) | "all".
+    alreadySeen: {mode: "played", paused: false, source: "all"},
     playlistFilter: {enabled: false, mode: "hideLarge", nameInTitles: false},
     tagFilter: {enabled: false, mode: "include", tags: []},
 };
 
-const VALID_SEEN_MODES = new Set(["on", "paused", "off"]);
+const VALID_SEEN_MODES = new Set(["off", "played", "seen"]);
+const HISTORY_KINDS = new Set(["seen", "played"]);
 const VALID_SEEN_SOURCES = new Set(["tab", "all"]);
 
 // How long seen tracks are kept (global, storage.sync scfSeenRetention), in months.
 const SEEN_RETENTION_LABELS = {1: "1 month", 3: "3 months", 6: "6 months", 12: "1 year"};
 const DEFAULT_SEEN_RETENTION = 12;
+
+// Seconds of listening before a play counts (global, scfPlayedThreshold). 0 is
+// SoundCloud's own play count, after about a second.
+const PLAYED_THRESHOLD_LABELS = {0: "Any play", 10: "10 seconds", 30: "30 seconds", 60: "1 minute"};
+const DEFAULT_PLAYED_THRESHOLD = 0;
+
+// When a playlist counts as played (global, scfPlaylistPlayedRule).
+const PLAYLIST_PLAYED_RULE_LABELS = {any: "Any track", all: "All tracks"};
+const DEFAULT_PLAYLIST_PLAYED_RULE = "any";
 
 const REPOST_TYPE_LABELS = {
     allowNone: "Block all",
@@ -64,21 +74,23 @@ function deepMerge(defaults, stored) {
 // with `defaults[key] !== null` to handle null default leaf values (min/max of
 // contentAgeInDays). The Array.isArray guard is load-bearing — do not remove.
 function sanitizeSettings(stored) {
-    // Legacy "Hide seen tracks" was {enabled: boolean}. Read it before
-    // deepMerge, which drops keys that aren't in DEFAULT_SETTINGS.
+    // Legacy "Hide seen tracks" was {enabled: boolean}, later {mode: "on" | "paused" | "off"}.
+    // Read it before deepMerge, which drops keys that aren't in DEFAULT_SETTINGS.
     const legacySeen = stored !== null && typeof stored === "object" ? stored.alreadySeen : null;
     const s = deepMerge(DEFAULT_SETTINGS, stored);
-    if (
-        legacySeen !== null && typeof legacySeen === "object" &&
-        !("mode" in legacySeen) && typeof legacySeen.enabled === "boolean"
-    ) {
-        s.alreadySeen.mode = legacySeen.enabled ? "on" : "off";
+    if (legacySeen !== null && typeof legacySeen === "object") {
+        if (!("mode" in legacySeen) && typeof legacySeen.enabled === "boolean") {
+            s.alreadySeen.mode = legacySeen.enabled ? "seen" : "off";
+        } else if (legacySeen.mode === "on" || legacySeen.mode === "paused") {
+            s.alreadySeen.mode = "seen";
+            s.alreadySeen.paused = legacySeen.mode === "paused";
+        }
     }
     if (!VALID_SEEN_MODES.has(s.alreadySeen.mode)) {
-        s.alreadySeen.mode = "on";
+        s.alreadySeen.mode = DEFAULT_SETTINGS.alreadySeen.mode;
     }
     if (!VALID_SEEN_SOURCES.has(s.alreadySeen.source)) {
-        s.alreadySeen.source = "tab";
+        s.alreadySeen.source = DEFAULT_SETTINGS.alreadySeen.source;
     }
     if (!VALID_FILTER_REPOSTS_TYPES.has(s.filterReposts.type)) {
         s.filterReposts.type = "allowNone";
@@ -224,23 +236,55 @@ function uniqueName(name, existingNames) {
     return `${name} (${n})`;
 }
 
-function withSeenMode(tab, mode) {
-    return {...tab, settings: {...tab.settings, alreadySeen: {...tab.settings.alreadySeen, mode}}};
+function withSeenPaused(tab, paused) {
+    return {...tab, settings: {...tab.settings, alreadySeen: {...tab.settings.alreadySeen, paused}}};
 }
 
-// Flips the active tab between "on" and "paused"; returns `tabs` itself when there is nothing to flip.
+// Flips the active tab's paused flag; returns `tabs` itself when there is nothing to flip.
 function tabsWithSeenPauseToggled(tabs, activeTabId) {
     const active = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
     if (active?.type !== "settings") return tabs;
-    const {mode} = active.settings.alreadySeen;
+    const {mode, paused} = active.settings.alreadySeen;
     if (mode === "off") return tabs;
-    return tabs.map((t) => (t === active ? withSeenMode(t, mode === "on" ? "paused" : "on") : t));
+    return tabs.map((t) => (t === active ? withSeenPaused(t, !paused) : t));
 }
 
-// The panel only decides on vs off; whether hiding is paused belongs to the tab bar.
+// The panel doesn't show the paused flag; it belongs to the tab bar. Changing the mode clears it.
 function withStoredPause(tab, stored) {
-    if (tab.type !== "settings" || tab.settings.alreadySeen.mode === "off") return tab;
-    return withSeenMode(tab, stored.settings.alreadySeen.mode === "paused" ? "paused" : "on");
+    if (tab.type !== "settings") return tab;
+    const {mode} = tab.settings.alreadySeen;
+    const was = stored.settings?.alreadySeen;
+    return withSeenPaused(tab, mode !== "off" && was?.mode === mode && was?.paused === true);
+}
+
+// kind: "seen" | "played"; scope: "tab" | "all".
+function historyListId(tabId, kind, scope) {
+    if (kind === "played") return scope === "all" ? "played" : `played:tab:${tabId}`;
+    return scope === "all" ? "all" : `tab:${tabId}`;
+}
+
+// The scope ("tab" | "all") a tab's history settings hide from, or null when off.
+function activeScopeOf({mode, source}) {
+    return mode === "off" ? null : source;
+}
+
+// The list a tab hides against right now, or null when it hides nothing.
+function hiddenListIdOf(tab) {
+    if (tab?.type !== "settings") return null;
+    const {mode, paused, source} = tab.settings.alreadySeen;
+    return mode === "off" || paused ? null : historyListId(tab.id, mode, source);
+}
+
+const HISTORY_SENTENCES = {
+    off: "Shows every track.",
+    "played:tab": "Hides tracks you played while this tab was open.",
+    "played:all": "Hides tracks you played on any tab.",
+    "seen:tab": "Hides tracks that scrolled past while this tab was open, and ones you played here.",
+    "seen:all": "Hides tracks that scrolled past on any tab, and every track you played.",
+};
+
+function historySentence({mode, source}) {
+    return HISTORY_SENTENCES[mode === "off" ? "off" : `${mode}:${source}`];
 }
 
 // Returns tabs with the entry matching `id` removed and the new active id.
@@ -275,6 +319,8 @@ async function loadState() {
             "scfDebug",
             "scfSeenRetention",
             "scfInfoOpen",
+            "scfPlayedThreshold",
+            "scfPlaylistPlayedRule",
         ]);
 
         let tabs = Array.isArray(stored.scFilterTabs) ? stored.scFilterTabs : null;
@@ -297,32 +343,44 @@ async function loadState() {
             ? stored.scActiveTabId
             : tabs[0].id;
 
-        const debug = stored.scfDebug === true;
-
         const seenRetention = Number.isInteger(stored.scfSeenRetention) && stored.scfSeenRetention in SEEN_RETENTION_LABELS
             ? stored.scfSeenRetention
             : DEFAULT_SEEN_RETENTION;
 
         const infoOpen = stored.scfInfoOpen === true;
 
-        return {tabs, activeTabId, debug, seenRetention, infoOpen};
+        const prefs = {
+            debug: stored.scfDebug === true,
+            playedThreshold: Number.isInteger(stored.scfPlayedThreshold) && stored.scfPlayedThreshold in PLAYED_THRESHOLD_LABELS
+                ? stored.scfPlayedThreshold
+                : DEFAULT_PLAYED_THRESHOLD,
+            playlistPlayedRule: Object.hasOwn(PLAYLIST_PLAYED_RULE_LABELS, stored.scfPlaylistPlayedRule)
+                ? stored.scfPlaylistPlayedRule
+                : DEFAULT_PLAYLIST_PLAYED_RULE,
+        };
+
+        return {tabs, activeTabId, prefs, seenRetention, infoOpen};
     } catch (_e) {
         const tabs = buildDefaultTabs();
-        return {tabs, activeTabId: tabs[0].id, debug: false, seenRetention: DEFAULT_SEEN_RETENTION, infoOpen: false};
+        return {tabs, activeTabId: tabs[0].id, prefs: defaultPrefs(), seenRetention: DEFAULT_SEEN_RETENTION, infoOpen: false};
     }
+}
+
+function defaultPrefs() {
+    return {debug: false, playedThreshold: DEFAULT_PLAYED_THRESHOLD, playlistPlayedRule: DEFAULT_PLAYLIST_PLAYED_RULE};
 }
 
 async function save(tabs, activeTabId) {
     await browser.storage.sync.set({scFilterTabs: tabs, scActiveTabId: activeTabId});
 }
 
-// Writes the active tab config (plus the debug flag) to the DOM and notifies
-// filter.js. intent must be "reset-feed" (rebuild the feed from scratch) or
-// "update-only" (swap the config for future requests, keep the feed as-is).
-// The event payload is a plain string — objects don't cross the
-// content-script ↔ page boundary cleanly in Firefox.
-function applyConfig(tabConfig, debug, intent) {
-    document.documentElement.dataset.scfConfig = JSON.stringify({...tabConfig, debug});
+// Writes the active tab config (plus the global prefs from loadState) to the
+// DOM and notifies filter.js. intent must be "reset-feed" (rebuild the feed
+// from scratch) or "update-only" (swap the config for future requests, keep
+// the feed as-is). The event payload is a plain string — objects don't cross
+// the content-script ↔ page boundary cleanly in Firefox.
+function applyConfig(tabConfig, prefs, intent) {
+    document.documentElement.dataset.scfConfig = JSON.stringify({...tabConfig, ...prefs});
     document.dispatchEvent(new CustomEvent("scf:apply-config", {detail: intent}));
 }
 
@@ -331,7 +389,7 @@ function applyConfig(tabConfig, debug, intent) {
 // rebuild fails, filter.js itself falls back to window.location.reload() —
 // state is already persisted at that point, so the reload boots into the
 // correct tab either way.
-async function saveAndResetFeed(tabs, activeTabId, debug) {
+async function saveAndResetFeed(tabs, activeTabId, prefs) {
     await save(tabs, activeTabId);
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
     // Start loading the new active tab's seen lists before the feed refetches,
@@ -339,11 +397,11 @@ async function saveAndResetFeed(tabs, activeTabId, debug) {
     warmSeenLists(activeTab);
     // Before applyConfig: the reset's scf:stats carries the new tab's id.
     setInfoTab(activeTab);
-    applyConfig(activeTab, debug, "reset-feed");
+    applyConfig(activeTab, prefs, "reset-feed");
 }
 
 // ── Impure: seen storage ──────────────────────────────────────────────────────
-// Lists ("tab:<id>" or "all") are stored as month buckets scfSeen:<listId>:<YYYY-MM>, sized in scfSeenIndex.
+// Lists ("tab:<id>", "all", "played:tab:<id>" or "played") are stored as month buckets scfSeen:<listId>:<YYYY-MM>, sized in scfSeenIndex.
 
 const SEEN_INDEX_KEY = "scfSeenIndex";
 const SEEN_FLUSH_DELAY_MS = 2000;
@@ -354,7 +412,7 @@ const SEEN_BYTES_PER_ID = 11;
 // listId → Promise<Set<number>>. Loaded lazily; the promise is the "ready"
 // gate that seen queries wait on.
 const seenSets = new Map();
-// listId → Set<number>, filled once the list's load finished. recordSeen adds
+// listId → Set<number>, filled once the list's load finished. recordIds adds
 // to these synchronously, so the next query already sees fresh ids.
 const seenLoaded = new Map();
 // listId → Set<number> of ids recorded but not yet written to storage.
@@ -368,10 +426,6 @@ function enqueueSeenOp(fn) {
     const run = seenQueue.then(fn);
     seenQueue = run.catch(() => {});
     return run;
-}
-
-function seenListIdFor(tabId, source) {
-    return source === "all" ? "all" : `tab:${tabId}`;
 }
 
 function seenBucketKey(listId, month) {
@@ -439,18 +493,32 @@ function getSeenSet(listId) {
     return ready;
 }
 
-// Starts loading the lists a tab records into, if it records at all.
+// Starts loading the lists a tab records into and hides against, if it records at all.
 function warmSeenLists(tab) {
     if (tab?.type !== "settings" || tab.settings.alreadySeen.mode === "off") return;
-    getSeenSet(seenListIdFor(tab.id, "tab"));
+    getSeenSet(historyListId(tab.id, "seen", "tab"));
     getSeenSet("all");
+    const hidden = hiddenListIdOf(tab);
+    if (hidden !== null) getSeenSet(hidden);
 }
 
-// Records ids a tab showed into its own list and the shared list. The
-// in-memory Sets update immediately; storage is written by a debounced flush.
 function recordSeen(tabId, ids) {
+    recordIds([historyListId(tabId, "seen", "tab"), "all"], ids);
+}
+
+// A played track also counts as seen, in the shared list and the tab's own, whatever its mode.
+function recordPlayed(tabId, ids) {
+    const lists = ["played", "all"];
+    if (typeof tabId === "string") {
+        lists.push(historyListId(tabId, "played", "tab"), historyListId(tabId, "seen", "tab"));
+    }
+    recordIds(lists, ids);
+}
+
+// The in-memory Sets update immediately; storage is written by a debounced flush.
+function recordIds(listIds, ids) {
     let added = false;
-    for (const listId of [seenListIdFor(tabId, "tab"), "all"]) {
+    for (const listId of listIds) {
         getSeenSet(listId); // make sure the list loads before the flush runs
         const set = seenLoaded.get(listId); // undefined while still loading
         let pending = seenPending.get(listId);
@@ -613,20 +681,31 @@ function seenBytes() {
     });
 }
 
-async function seenSummary(tabId) {
-    const [tab, all, bytes] = await Promise.all([seenCount(seenListIdFor(tabId, "tab")), seenCount("all"), seenBytes()]);
-    return {tab, all, bytes};
+// {tabSeen, tabPlayed, allSeen, allPlayed} for the tab with id `tabId`.
+async function historyCounts(tabId) {
+    const [tabSeen, tabPlayed, allSeen, allPlayed] = await Promise.all([
+        seenCount(historyListId(tabId, "seen", "tab")),
+        seenCount(historyListId(tabId, "played", "tab")),
+        seenCount("all"),
+        seenCount("played"),
+    ]);
+    return {tabSeen, tabPlayed, allSeen, allPlayed};
 }
 
-// Clears a list and rebuilds the feed only if the active tab currently hides against it.
-async function resetSeenList(listId) {
-    await clearSeen([listId]);
-    const {tabs, activeTabId, debug} = await loadState();
+async function seenSummary(tabId) {
+    const [counts, bytes] = await Promise.all([historyCounts(tabId), seenBytes()]);
+    return {...counts, bytes};
+}
+
+// Clears both lists of one scope ("tab" | "all") and rebuilds the feed only if
+// the active tab currently hides against one of them.
+async function resetHistoryScope(tabId, scope) {
+    const listIds = [historyListId(tabId, "seen", scope), historyListId(tabId, "played", scope)];
+    await clearSeen(listIds);
+    const {tabs, activeTabId, prefs} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-    if (activeTab.type !== "settings") return;
-    const {mode, source} = activeTab.settings.alreadySeen;
-    if (mode === "on" && seenListIdFor(activeTab.id, source) === listId) {
-        await saveAndResetFeed(tabs, activeTabId, debug);
+    if (listIds.includes(hiddenListIdOf(activeTab))) {
+        await saveAndResetFeed(tabs, activeTabId, prefs);
     }
 }
 
@@ -641,7 +720,8 @@ document.addEventListener("scf:seen-query", (event) => {
         return;
     }
     if (!query || typeof query.tabId !== "string" || !Array.isArray(query.ids)) return;
-    getSeenSet(seenListIdFor(query.tabId, query.source)).then((set) => {
+    if (!HISTORY_KINDS.has(query.list) || !VALID_SEEN_SOURCES.has(query.source)) return;
+    getSeenSet(historyListId(query.tabId, query.list, query.source)).then((set) => {
         const seen = query.ids.filter((id) => set.has(id));
         document.dispatchEvent(new CustomEvent("scf:seen-result", {
             detail: JSON.stringify({reqId: query.reqId, seen}),
@@ -661,6 +741,18 @@ document.addEventListener("scf:seen", (event) => {
     if (ids.length > 0) recordSeen(report.tabId, ids);
 });
 
+document.addEventListener("scf:played", (event) => {
+    let report;
+    try {
+        report = JSON.parse(event.detail);
+    } catch (_e) {
+        return;
+    }
+    if (!report || !(report.tabId === null || typeof report.tabId === "string") || !Array.isArray(report.ids)) return;
+    const ids = report.ids.filter((id) => Number.isInteger(id));
+    if (ids.length > 0) recordPlayed(report.tabId, ids);
+});
+
 window.addEventListener("pagehide", flushSeenNow);
 document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flushSeenNow();
@@ -669,7 +761,7 @@ document.addEventListener("visibilitychange", () => {
 // ── Impure: tab bar info section ──────────────────────────────────────────────
 
 let infoTab = null; // the active tab the info section describes
-let infoCounts = {tab: 0, all: 0};
+let infoCounts = {tabSeen: 0, tabPlayed: 0, allSeen: 0, allPlayed: 0};
 let infoStats = null; // last scf:stats of infoTab, null until its feed reports
 
 function setInfoTab(tab) {
@@ -693,13 +785,10 @@ function scheduleInfoRefresh() {
 async function refreshInfoCounts() {
     const tab = infoTab;
     if (!tab) return;
-    const [tabCount, allCount] = await Promise.all([
-        seenCount(seenListIdFor(tab.id, "tab")),
-        seenCount("all"),
-    ]);
+    const counts = await historyCounts(tab.id);
     // A newer refresh for the new tab is already on its way.
     if (infoTab?.id !== tab.id) return;
-    infoCounts = {tab: tabCount, all: allCount};
+    infoCounts = counts;
     renderInfo();
 }
 
@@ -707,22 +796,23 @@ async function refreshInfoCounts() {
 function renderInfo() {
     const item = document.querySelector("#scf-tab-bar .scf-info-item");
     if (!item || !infoTab) return;
-    const {mode, source} = infoTab.type === "settings"
+    const {mode, paused, source} = infoTab.type === "settings"
         ? infoTab.settings.alreadySeen
-        : {mode: "off", source: "tab"};
+        : {mode: "off", paused: false, source: "tab"};
     const off = mode === "off";
-    const paused = mode === "paused";
+    const played = mode === "played";
+    const noun = played ? "Played" : "Seen";
     const toggle = item.querySelector(".scf-seen-toggle");
     toggle.hidden = off;
     toggle.classList.toggle("scf-paused", paused);
     toggle.querySelector(".scf-seen-toggle-label").textContent = paused ? "Resume hiding" : "Pause hiding";
-    toggle.title = paused ? "Hide seen tracks on this tab again" : "Show hidden tracks temporarily";
+    toggle.title = paused ? `Hide ${noun.toLowerCase()} tracks on this tab again` : "Show hidden tracks temporarily";
     item.querySelector(".scf-info-seen-label").textContent =
-        off ? "Seen: off" : paused ? "Seen (paused):" : "Seen:";
+        off ? "Seen: off" : paused ? `${noun} (paused):` : `${noun}:`;
     for (const el of item.querySelectorAll(".scf-info-seen")) {
-        const count = formatCount(infoCounts[el.dataset.source]);
-        el.textContent = `${count} ${el.dataset.source === "all" ? "all tabs" : "this tab"}`;
-        el.classList.toggle("scf-info-muted", el.dataset.source !== source);
+        const scope = el.dataset.source;
+        el.textContent = `${formatCount(infoCounts[scope + noun])} ${scope === "all" ? "all tabs" : "this tab"}`;
+        el.classList.toggle("scf-info-muted", scope !== source);
         el.hidden = off;
     }
     item.querySelector(".scf-info-seen-sep").hidden = off;
@@ -885,12 +975,17 @@ function selectHtml(id, labels, selected) {
 }
 
 function retentionTip(months) {
-    return `Hides seen tracks for ${SEEN_RETENTION_LABELS[months]}, then they show up again. Applies to every tab.`;
+    return `Hides seen and played tracks for ${SEEN_RETENTION_LABELS[months]}, then they show up again. Applies to every tab.`;
 }
 
-function seenCountLine(source, label, count, activeSource) {
-    return `<div class="scf-seen-count${source === activeSource ? "" : " scf-seen-count-muted"}" data-source="${source}" data-count="${count}">
-          ${label}: <span class="scf-seen-num">${formatCount(count)}</span> seen<span class="scf-seen-reset-wrap"${count === 0 ? " hidden" : ""}> · <button class="scf-seen-reset">Reset</button></span>
+function historyTip(months) {
+    return `Played hides tracks you played; Seen also hides everything that scrolled past on screen. Both are remembered for ${SEEN_RETENTION_LABELS[months]}. Pause hiding from the tab bar.`;
+}
+
+// scope: "tab" | "all"
+function historyCountLine(scope, label, seen, played, activeScope) {
+    return `<div class="scf-seen-count${scope === activeScope ? "" : " scf-seen-count-muted"}" data-source="${scope}" data-seen="${seen}" data-played="${played}">
+          ${label}: <span class="scf-seen-num">${formatCount(seen)}</span> seen · <span class="scf-seen-num">${formatCount(played)}</span> played<span class="scf-seen-reset-wrap"${seen + played === 0 ? " hidden" : ""}> · <button class="scf-seen-reset">Reset</button></span>
         </div>`;
 }
 
@@ -1016,30 +1111,32 @@ function buildSettingsPanel(tab, {counts, retention}) {
 
       <div class="scf-group">
         <div class="scf-row">
-          <span class="scf-row-label">Hide seen tracks <span class="scf-help" data-tip="Hides tracks you've already seen, for ${SEEN_RETENTION_LABELS[retention]}. Pause it from the tab bar to show them temporarily.">?</span></span>
-          <label class="scf-toggle">
-            <input type="checkbox" id="scf-as-toggle"${s.alreadySeen.mode !== "off" ? " checked" : ""}>
-            <span class="scf-toggle-track"></span>
-          </label>
+          <span class="scf-row-label">Hide tracks I've… <span class="scf-help" data-tip="${historyTip(retention)}">?</span></span>
         </div>
-        <div class="scf-sub-section${s.alreadySeen.mode !== "off" ? " scf-visible" : ""}" id="scf-as-sub">
-          <div class="scf-inline-row">
-            <span class="scf-row-label">Hide tracks seen in</span>
+        <div class="scf-sub-section scf-visible" id="scf-as-sub">
+          <div class="scf-segmented" id="scf-as-mode">
+            <button class="scf-seg-btn${s.alreadySeen.mode === "off" ? " scf-active" : ""}" data-mode="off">Off</button>
+            <button class="scf-seg-btn${s.alreadySeen.mode === "played" ? " scf-active" : ""}" data-mode="played">Played</button>
+            <button class="scf-seg-btn${s.alreadySeen.mode === "seen" ? " scf-active" : ""}" data-mode="seen">Seen</button>
+          </div>
+          <div class="scf-inline-row" id="scf-as-scope"${s.alreadySeen.mode === "off" ? " hidden" : ""}>
+            <span class="scf-row-label">in</span>
             <div class="scf-segmented" id="scf-as-source">
               <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">This tab</button>
               <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">Any tab</button>
             </div>
           </div>
+          <p class="scf-filter-info" id="scf-as-info">${historySentence(s.alreadySeen)}</p>
         </div>
       </div>
 
       <div class="scf-group">
         <div class="scf-row">
-          <span class="scf-row-label">Seen tracks</span>
+          <span class="scf-row-label">History</span>
         </div>
         <div class="scf-sub-section scf-visible scf-seen-counts">
-          ${seenCountLine("tab", "This tab", counts.tab, s.alreadySeen.source)}
-          ${seenCountLine("all", "All tabs", counts.all, s.alreadySeen.source)}
+          ${historyCountLine("tab", "This tab", counts.tabSeen, counts.tabPlayed, activeScopeOf(s.alreadySeen))}
+          ${historyCountLine("all", "All tabs", counts.allSeen, counts.allPlayed, activeScopeOf(s.alreadySeen))}
         </div>
       </div>
     </div>
@@ -1055,7 +1152,7 @@ function buildSettingsPanel(tab, {counts, retention}) {
     return panel;
 }
 
-function buildGlobalPanel(debug, {retention, activeTab, seen}) {
+function buildGlobalPanel({debug, playedThreshold, playlistPlayedRule}, {retention, activeTab, seen}) {
     const panel = document.createElement("div");
     panel.id = "scf-global-panel";
     panel.innerHTML = `
@@ -1065,17 +1162,25 @@ function buildGlobalPanel(debug, {retention, activeTab, seen}) {
     </div>
     <div class="scf-body">
       <div class="scf-row">
-        <span class="scf-row-label">Remember seen tracks <span class="scf-help" id="scf-seen-retention-help" data-tip="${retentionTip(retention)}">?</span></span>
+        <span class="scf-row-label">Remember seen &amp; played tracks <span class="scf-help" id="scf-seen-retention-help" data-tip="${retentionTip(retention)}">?</span></span>
         ${selectHtml("scf-seen-retention", SEEN_RETENTION_LABELS, retention)}
+      </div>
+      <div class="scf-row">
+        <span class="scf-row-label">Count as played <span class="scf-nowrap">after <span class="scf-help" data-tip="How long a track has to play before it counts as played. Any play counts as soon as SoundCloud does, after about a second. Seeking doesn't count.">?</span></span></span>
+        ${selectHtml("scf-played-threshold", PLAYED_THRESHOLD_LABELS, playedThreshold)}
+      </div>
+      <div class="scf-row">
+        <span class="scf-row-label">Playlist counts as played when <span class="scf-help" data-tip="On tabs that hide played tracks: hide a playlist once any of its tracks was played, or only once all of them were.">?</span></span>
+        ${selectHtml("scf-playlist-played-rule", PLAYLIST_PLAYED_RULE_LABELS, playlistPlayedRule)}
       </div>
       <div class="scf-group" id="scf-seen-data">
         <div class="scf-row">
-          <span class="scf-row-label">Seen tracks</span>
+          <span class="scf-row-label">History</span>
           <button class="scf-seen-reset" id="scf-clear-seen-btn"${seen.bytes === 0 ? " hidden" : ""}>Clear all</button>
         </div>
         <div class="scf-sub-section scf-visible scf-seen-counts">
-          <div class="scf-seen-count"><span class="scf-seen-tab-name"></span>: <span class="scf-seen-num" data-count="tab">${formatCount(seen.tab)}</span> seen</div>
-          <div class="scf-seen-count">All tabs: <span class="scf-seen-num" data-count="all">${formatCount(seen.all)}</span> seen · <span class="scf-seen-num" data-count="bytes">${formatBytes(seen.bytes)}</span></div>
+          <div class="scf-seen-count"><span class="scf-seen-tab-name"></span>: <span class="scf-seen-num" data-count="tabSeen">${formatCount(seen.tabSeen)}</span> seen · <span class="scf-seen-num" data-count="tabPlayed">${formatCount(seen.tabPlayed)}</span> played</div>
+          <div class="scf-seen-count">All tabs: <span class="scf-seen-num" data-count="allSeen">${formatCount(seen.allSeen)}</span> seen · <span class="scf-seen-num" data-count="allPlayed">${formatCount(seen.allPlayed)}</span> played · <span class="scf-seen-num" data-count="bytes">${formatBytes(seen.bytes)}</span></div>
         </div>
       </div>
       <div class="scf-row">
@@ -1182,7 +1287,7 @@ function dualSlider(el, prefix, maxFloor, renderLabel) {
     update();
 }
 
-function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen}) {
+function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistory}) {
     // Close buttons
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
     el.querySelector("#scf-close-footer-btn").addEventListener("click", onClose);
@@ -1223,30 +1328,35 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
         frInfoEl.textContent = REPOST_INFO[e.target.value] ?? "";
     });
 
-    const asSub = el.querySelector("#scf-as-sub");
-    el.querySelector("#scf-as-toggle").addEventListener("change", (e) => {
-        asSub.classList.toggle("scf-visible", e.target.checked);
-    });
-
     const countLines = el.querySelectorAll(".scf-seen-count");
-    for (const btn of el.querySelectorAll("#scf-as-source .scf-seg-btn")) {
-        btn.addEventListener("click", () => {
-            for (const line of countLines) {
-                line.classList.toggle("scf-seen-count-muted", line.dataset.source !== btn.dataset.source);
-            }
-        });
+    const scopeEl = el.querySelector("#scf-as-scope");
+    const infoEl = el.querySelector("#scf-as-info");
+    // Runs after the segmented group's own handler has moved scf-active.
+    function renderHistoryChoice() {
+        const choice = readHistoryChoice();
+        scopeEl.hidden = choice.mode === "off";
+        infoEl.textContent = historySentence(choice);
+        const activeScope = activeScopeOf(choice);
+        for (const line of countLines) {
+            line.classList.toggle("scf-seen-count-muted", line.dataset.source !== activeScope);
+        }
+    }
+    for (const btn of el.querySelectorAll("#scf-as-mode .scf-seg-btn, #scf-as-source .scf-seg-btn")) {
+        btn.addEventListener("click", renderHistoryChoice);
     }
     for (const line of countLines) {
-        const source = line.dataset.source;
+        const scope = line.dataset.source;
         line.querySelector(".scf-seen-reset").addEventListener("click", () => {
-            const count = Number(line.dataset.count);
-            const noun = count === 1 ? "track" : "tracks";
-            const where = source === "all" ? "all tabs" : "this tab";
-            if (!confirm(`Forget ${formatCount(count)} ${noun} seen in ${where}?`)) return;
-            onResetSeen(seenListIdFor(tab.id, source))
+            const counts = `${formatCount(Number(line.dataset.seen))} seen and ${formatCount(Number(line.dataset.played))} played tracks`;
+            const question = scope === "all"
+                ? `Forget ${counts} across all tabs? Each tab's own history is kept.`
+                : `Forget ${counts} of this tab?`;
+            if (!confirm(question)) return;
+            onResetHistory(tab.id, scope)
                 .then(() => {
-                    line.dataset.count = "0";
-                    line.querySelector(".scf-seen-num").textContent = formatCount(0);
+                    line.dataset.seen = "0";
+                    line.dataset.played = "0";
+                    for (const num of line.querySelectorAll(".scf-seen-num")) num.textContent = formatCount(0);
                     line.querySelector(".scf-seen-reset-wrap").hidden = true;
                 })
                 .catch(console.error);
@@ -1369,6 +1479,15 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
         renderChips();
     });
 
+    function readHistoryChoice() {
+        const current = tab.type === "settings" ? tab.settings.alreadySeen : sanitizeSettings({}).alreadySeen;
+        return {
+            mode: el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? current.mode,
+            paused: current.paused,
+            source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? current.source,
+        };
+    }
+
     function readPanelState() {
         const settings = tab.type === "settings"
             ? JSON.parse(JSON.stringify(tab.settings))
@@ -1386,10 +1505,7 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
         settings.contentAgeInDays.max = uiToStorageMax(parseInt(el.querySelector("#scf-ca-max").value, 10));
 
         settings.freeDownloadsOnly.enabled = el.querySelector("#scf-fd-toggle").checked;
-        settings.alreadySeen = {
-            mode: el.querySelector("#scf-as-toggle").checked ? "on" : "off",
-            source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? settings.alreadySeen.source,
-        };
+        settings.alreadySeen = readHistoryChoice();
         settings.playlistFilter.enabled = el.querySelector("#scf-pf-toggle").checked;
         settings.playlistFilter.mode = el.querySelector("#scf-pf-mode .scf-seg-btn.scf-active")?.dataset.mode ?? "hideLarge";
         settings.playlistFilter.nameInTitles = el.querySelector("#scf-pf-nit-toggle").checked;
@@ -1406,7 +1522,7 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetSeen})
     }
 }
 
-function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onClearAllSeen}) {
+function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onPlayedThresholdChange, onPlaylistRuleChange, onClearAllSeen}) {
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
     el.querySelector("#scf-restore-btn").addEventListener("click", onRestore);
     el.querySelector("#scf-debug-checkbox").addEventListener("change", (e) => {
@@ -1427,18 +1543,21 @@ function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRe
         retentionHelp.dataset.tip = retentionTip(Number(e.target.value));
         onRetentionChange(Number(e.target.value)).then(showSeen).catch(console.error);
     });
+    el.querySelector("#scf-played-threshold").addEventListener("change", (e) => {
+        onPlayedThresholdChange(Number(e.target.value)).catch(console.error);
+    });
+    el.querySelector("#scf-playlist-played-rule").addEventListener("change", (e) => {
+        onPlaylistRuleChange(e.target.value).catch(console.error);
+    });
 
     clearSeenBtn.addEventListener("click", () => {
-        if (!confirm("Forget all seen tracks?")) return;
-        onClearAllSeen().then(() => showSeen({tab: 0, all: 0, bytes: 0})).catch(console.error);
+        if (!confirm("Forget all seen and played tracks?")) return;
+        onClearAllSeen().then(() => showSeen({tabSeen: 0, tabPlayed: 0, allSeen: 0, allPlayed: 0, bytes: 0})).catch(console.error);
     });
 }
 
 async function openSettingsPanel(tab, handlers) {
-    const counts = {
-        tab: await seenCount(seenListIdFor(tab.id, "tab")),
-        all: await seenCount("all"),
-    };
+    const counts = await historyCounts(tab.id);
     document.getElementById("scf-settings-panel")?.remove();
     document.getElementById("scf-global-panel")?.remove();
     const el = buildSettingsPanel(tab, {counts, retention: handlers.retention});
@@ -1451,7 +1570,7 @@ async function openGlobalPanel(handlers) {
     const seen = await seenSummary(handlers.activeTab.id);
     document.getElementById("scf-global-panel")?.remove();
     document.getElementById("scf-settings-panel")?.remove();
-    const el = buildGlobalPanel(handlers.debug, {retention: handlers.retention, activeTab: handlers.activeTab, seen});
+    const el = buildGlobalPanel(handlers.prefs, {retention: handlers.retention, activeTab: handlers.activeTab, seen});
     attachGlobalPanelListeners(el, handlers);
     attachTooltipListeners(el);
     document.body.appendChild(el);
@@ -1483,9 +1602,9 @@ async function initFilters() {
     // so infinite scroll never fires. Firefox reads the mode when the reload starts.
     history.scrollRestoration = window.location.href.includes("soundcloud.com/feed") ? "manual" : "auto";
 
-    const {tabs, activeTabId, debug, seenRetention, infoOpen} = await loadState();
+    const {tabs, activeTabId, prefs, seenRetention, infoOpen} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-    applyConfig(activeTab, debug, "update-only");
+    applyConfig(activeTab, prefs, "update-only");
 
     if (!window.location.href.includes("soundcloud.com/feed")) return;
 
@@ -1506,9 +1625,9 @@ async function initFilters() {
     const tabBarEl = buildTabBar(tabs, activeTabId, {infoOpen});
     attachTabBarListeners(tabBarEl, {
         onTabClick: async (id) => {
-            const {tabs, activeTabId, debug} = await loadState();
+            const {tabs, activeTabId, prefs} = await loadState();
             if (id === activeTabId) return;
-            await saveAndResetFeed(tabs, id, debug);
+            await saveAndResetFeed(tabs, id, prefs);
             // The tab set is unchanged — just move the active highlight.
             for (const li of tabBarEl.querySelectorAll("[data-tab-id]")) {
                 li.querySelector(".g-tabs-link").classList.toggle("active", li.dataset.tabId === id);
@@ -1522,13 +1641,13 @@ async function initFilters() {
                 retention: seenRetention,
                 // Save and Delete re-read state: the tab bar stays usable while the panel is open.
                 onSave: async (updatedTab) => {
-                    const {tabs, activeTabId, debug} = await loadState();
+                    const {tabs, activeTabId, prefs} = await loadState();
                     const stored = tabs.find((t) => t.id === updatedTab.id);
                     if (!stored) return;
                     const saved = withStoredPause(updatedTab, stored);
                     const newTabs = tabs.map((t) => (t.id === saved.id ? saved : t));
                     if (saved.id === activeTabId) {
-                        await saveAndResetFeed(newTabs, activeTabId, debug);
+                        await saveAndResetFeed(newTabs, activeTabId, prefs);
                     } else {
                         await save(newTabs, activeTabId);
                     }
@@ -1539,11 +1658,11 @@ async function initFilters() {
                 // hides the Delete button when onDelete is undefined.
                 onDelete: tabs.length > 1 ? async () => {
                     if (!confirm("Delete this filter?")) return;
-                    const {tabs, activeTabId, debug} = await loadState();
+                    const {tabs, activeTabId, prefs} = await loadState();
                     if (tabs.length <= 1 || !tabs.some((t) => t.id === id)) return;
                     const {tabs: newTabs, newActiveId} = tabsAfterDelete(tabs, id);
                     if (id === activeTabId) {
-                        await saveAndResetFeed(newTabs, newActiveId, debug);
+                        await saveAndResetFeed(newTabs, newActiveId, prefs);
                         document.getElementById("scf-settings-panel")?.remove();
                         initFilters();
                     } else {
@@ -1551,35 +1670,42 @@ async function initFilters() {
                         document.getElementById("scf-settings-panel")?.remove();
                         initFilters();
                     }
-                    await clearSeen([seenListIdFor(id, "tab")]);
+                    await clearSeen([historyListId(id, "seen", "tab"), historyListId(id, "played", "tab")]);
                 } : undefined,
-                onResetSeen: resetSeenList,
+                onResetHistory: resetHistoryScope,
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
             });
         },
         onGlobalGearClick: async () => {
-            let {tabs, activeTabId, debug, seenRetention} = await loadState();
+            const {tabs, activeTabId, prefs, seenRetention} = await loadState();
             const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+            async function savePref(key, value, resetsFeed) {
+                await browser.storage.sync.set({[key]: value});
+                const {tabs, activeTabId, prefs} = await loadState();
+                const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
+                if (resetsFeed(activeTab)) {
+                    await saveAndResetFeed(tabs, activeTabId, prefs);
+                } else {
+                    applyConfig(activeTab, prefs, "update-only");
+                }
+            }
             await openGlobalPanel({
-                debug,
+                prefs,
                 retention: seenRetention,
                 activeTab,
                 onRestore: async () => {
                     const defaults = buildDefaultTabs();
                     await clearSeen(null);
-                    await saveAndResetFeed(defaults, defaults[0].id, debug);
+                    await saveAndResetFeed(defaults, defaults[0].id, (await loadState()).prefs);
                     document.getElementById("scf-global-panel")?.remove();
                     initFilters();
                 },
-                onDebugChange: async (enabled) => {
-                    debug = enabled;
-                    await browser.storage.sync.set({scfDebug: enabled});
-                    const {tabs, activeTabId} = await loadState();
-                    const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-                    applyConfig(activeTab, enabled, "update-only");
-                },
+                onDebugChange: (enabled) => savePref("scfDebug", enabled, () => false),
+                onPlayedThresholdChange: (seconds) => savePref("scfPlayedThreshold", seconds, () => false),
+                onPlaylistRuleChange: (rule) => savePref("scfPlaylistPlayedRule", rule,
+                    (tab) => hiddenListIdOf(tab) !== null && tab.settings.alreadySeen.mode === "played"),
                 onRetentionChange: async (months) => {
                     await browser.storage.sync.set({scfSeenRetention: months});
                     await pruneSeen(months);
@@ -1587,8 +1713,8 @@ async function initFilters() {
                 },
                 onClearAllSeen: async () => {
                     await clearSeen(null);
-                    const {tabs, activeTabId, debug} = await loadState();
-                    await saveAndResetFeed(tabs, activeTabId, debug);
+                    const {tabs, activeTabId, prefs} = await loadState();
+                    await saveAndResetFeed(tabs, activeTabId, prefs);
                 },
                 onClose: () => {
                     document.getElementById("scf-global-panel")?.remove();
@@ -1612,7 +1738,7 @@ async function initFilters() {
                     document.getElementById("scf-settings-panel")?.remove();
                     initFilters();
                 },
-                onResetSeen: resetSeenList,
+                onResetHistory: resetHistoryScope,
                 onClose: () => {
                     document.getElementById("scf-settings-panel")?.remove();
                 },
@@ -1622,10 +1748,10 @@ async function initFilters() {
             browser.storage.sync.set({scfInfoOpen: open}).catch(console.error);
         },
         onSeenPauseToggle: async () => {
-            const {tabs, activeTabId, debug} = await loadState();
+            const {tabs, activeTabId, prefs} = await loadState();
             const newTabs = tabsWithSeenPauseToggled(tabs, activeTabId);
             if (newTabs === tabs) return;
-            await saveAndResetFeed(newTabs, activeTabId, debug);
+            await saveAndResetFeed(newTabs, activeTabId, prefs);
         },
     });
 

@@ -298,6 +298,7 @@ body.theme-light {
   gap: 8px;
 }
 .scf-inline-row > .scf-segmented { flex-shrink: 0; }
+.scf-inline-row[hidden] { display: none; }
 
 .scf-sub-section {
   display: none;
@@ -363,7 +364,9 @@ body.theme-light {
 }
 .scf-row .scf-select { padding: 4px 24px 4px 8px; }
 .scf-row .scf-select-chevron { right: 8px; }
-#scf-seen-retention { width: 96px; }
+#scf-seen-retention, #scf-played-threshold { width: 96px; }
+#scf-playlist-played-rule { width: 96px; }
+.scf-nowrap { white-space: nowrap; }
 
 .scf-segmented {
   display: flex;
