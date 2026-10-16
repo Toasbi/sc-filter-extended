@@ -43,9 +43,10 @@ const VALID_FILTER_REPOSTS_TYPES = new Set(Object.keys(REPOST_TYPE_LABELS));
 
 const VALID_PLAYLIST_FILTER_MODES = new Set(["hideLarge", "hideAll"]);
 
-// External links shown in the global settings panel.
+// External links, also used by cards.js.
 const BUY_ME_A_COFFEE_URL = "https://buymeacoffee.com/toaster2";
 const GITHUB_ISSUES_URL = "https://github.com/Toasbi/sc-filter-extended/issues";
+const COFFEE_ICON_SVG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M20.216 6.415l-.132-.666c-.119-.598-.388-1.163-1.001-1.379-.197-.069-.42-.098-.57-.241-.152-.143-.196-.366-.231-.572-.065-.378-.125-.756-.192-1.133-.057-.325-.102-.69-.25-.987-.195-.4-.597-.634-.996-.788a5.723 5.723 0 00-.626-.194c-1-.263-2.05-.36-3.077-.416a25.834 25.834 0 00-3.7.062c-.915.083-1.88.184-2.75.5-.318.116-.646.256-.888.501-.297.302-.393.77-.177 1.146.154.267.415.456.692.58.36.162.737.284 1.123.366 1.075.238 2.189.331 3.287.37 1.218.05 2.437.01 3.65-.118.299-.033.598-.073.896-.119.352-.054.578-.513.474-.834-.124-.383-.457-.531-.834-.473-.466.074-.96.108-1.382.146-1.177.08-2.358.082-3.536.006a22.228 22.228 0 01-1.157-.107c-.086-.01-.18-.025-.258-.036-.243-.036-.484-.08-.724-.13-.111-.027-.111-.185 0-.212h.005c.277-.06.557-.108.838-.147h.002c.131-.009.263-.032.394-.048a25.076 25.076 0 013.426-.12c.674.019 1.347.067 2.017.144l.228.031c.267.04.533.088.798.145.392.085.895.113 1.07.542.055.137.08.288.111.431l.319 1.484a.237.237 0 01-.199.284h-.003c-.037.006-.075.01-.112.015a36.704 36.704 0 01-4.743.295 37.059 37.059 0 01-4.699-.304c-.14-.017-.293-.042-.417-.06-.326-.048-.649-.108-.973-.161-.393-.065-.768-.032-1.123.161-.29.16-.527.404-.675.701-.154.316-.199.66-.267 1.001-.069.34-.176.707-.135 1.056.087.753.613 1.365 1.37 1.502a39.69 39.69 0 0011.343.376.483.483 0 01.535.53l-.071.697-1.018 9.907c-.041.41-.047.832-.125 1.237-.122.637-.553 1.028-1.182 1.171-.577.131-1.165.2-1.756.205-.656.004-1.31-.025-1.966-.022-.699.004-1.556-.06-2.095-.58-.475-.458-.54-1.174-.605-1.793l-.731-7.13-.322-3.152c-.037-.36-.351-.634-.708-.618-.339.014-.618.322-.579.694l.318 3.106.907 8.844c.083.808.83 1.6 1.664 1.789.905.204 1.803.238 2.719.243 1.19.007 2.401.007 3.567-.238.85-.178 1.696-.579 2.077-1.412.145-.318.244-.686.312-1.027.09-.457.14-.919.19-1.379l.24-2.2.522-4.789.19-1.751a.237.237 0 01.264-.209c.31.045.63.108.94.16.42.07.844.14 1.267.212 1.24.207 2.454.481 3.685.717.35.067.7.146 1.05.187a.237.237 0 01.208.263l-.174 1.61c-.041.376.207.7.579.72.339.017.626-.247.663-.585l.393-3.625c.017-.16.017-.322-.02-.48z"/></svg>`;
 
 // ── Pure: settings helpers ────────────────────────────────────────────────────
 
@@ -276,15 +277,15 @@ function hiddenListIdOf(tab) {
 }
 
 const HISTORY_SENTENCES = {
-    off: "Shows every track.",
     "played:tab": "Hides tracks you played while this tab was open.",
     "played:all": "Hides tracks you played on any tab.",
     "seen:tab": "Hides tracks that scrolled past while this tab was open, and ones you played here.",
     "seen:all": "Hides tracks that scrolled past on any tab, and every track you played.",
 };
 
+// mode: "played" | "seen"
 function historySentence({mode, source}) {
-    return HISTORY_SENTENCES[mode === "off" ? "off" : `${mode}:${source}`];
+    return HISTORY_SENTENCES[`${mode}:${source}`];
 }
 
 // Returns tabs with the entry matching `id` removed and the new active id.
@@ -767,8 +768,9 @@ let infoStats = null; // last scf:stats of infoTab, null until its feed reports
 function setInfoTab(tab) {
     if (infoTab?.id !== tab.id) infoStats = null;
     infoTab = tab;
-    refreshInfoCounts();
+    const counted = refreshInfoCounts();
     renderInfo();
+    return counted;
 }
 
 let infoRefreshTimer = null;
@@ -991,6 +993,9 @@ function historyCountLine(scope, label, seen, played, activeScope) {
 
 function buildSettingsPanel(tab, {counts, retention}) {
     const s = tab.type === "settings" ? tab.settings : sanitizeSettings({});
+    const historyOn = s.alreadySeen.mode !== "off";
+    // Preselected while off, so re-enabling has a sensible mode.
+    const historyMode = historyOn ? s.alreadySeen.mode : "played";
     const panel = document.createElement("div");
     panel.id = "scf-settings-panel";
 
@@ -1112,21 +1117,21 @@ function buildSettingsPanel(tab, {counts, retention}) {
       <div class="scf-group">
         <div class="scf-row">
           <span class="scf-row-label">Hide tracks I've… <span class="scf-help" data-tip="${historyTip(retention)}">?</span></span>
+          <label class="scf-toggle">
+            <input type="checkbox" id="scf-as-toggle"${historyOn ? " checked" : ""}>
+            <span class="scf-toggle-track"></span>
+          </label>
         </div>
-        <div class="scf-sub-section scf-visible" id="scf-as-sub">
+        <div class="scf-sub-section${historyOn ? " scf-visible" : ""}" id="scf-as-sub">
           <div class="scf-segmented" id="scf-as-mode">
-            <button class="scf-seg-btn${s.alreadySeen.mode === "off" ? " scf-active" : ""}" data-mode="off">Off</button>
-            <button class="scf-seg-btn${s.alreadySeen.mode === "played" ? " scf-active" : ""}" data-mode="played">Played</button>
-            <button class="scf-seg-btn${s.alreadySeen.mode === "seen" ? " scf-active" : ""}" data-mode="seen">Seen</button>
+            <button class="scf-seg-btn${historyMode === "played" ? " scf-active" : ""}" data-mode="played">Played</button>
+            <button class="scf-seg-btn${historyMode === "seen" ? " scf-active" : ""}" data-mode="seen">Seen</button>
           </div>
-          <div class="scf-inline-row" id="scf-as-scope"${s.alreadySeen.mode === "off" ? " hidden" : ""}>
-            <span class="scf-row-label">in</span>
-            <div class="scf-segmented" id="scf-as-source">
-              <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">This tab</button>
-              <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">Any tab</button>
-            </div>
+          <div class="scf-segmented" id="scf-as-source">
+            <button class="scf-seg-btn${s.alreadySeen.source === "tab" ? " scf-active" : ""}" data-source="tab">In this tab</button>
+            <button class="scf-seg-btn${s.alreadySeen.source === "all" ? " scf-active" : ""}" data-source="all">In any tab</button>
           </div>
-          <p class="scf-filter-info" id="scf-as-info">${historySentence(s.alreadySeen)}</p>
+          <p class="scf-filter-info" id="scf-as-info">${historySentence({mode: historyMode, source: s.alreadySeen.source})}</p>
         </div>
       </div>
 
@@ -1141,7 +1146,7 @@ function buildSettingsPanel(tab, {counts, retention}) {
       </div>
     </div>
     <div class="scf-panel-footer">
-      <button class="scf-delete-btn" id="scf-delete-btn">Delete</button>
+      <button class="scf-text-btn scf-delete-btn" id="scf-delete-btn">Delete</button>
       <button class="scf-btn" id="scf-close-footer-btn">Close</button>
       <button class="scf-btn scf-btn-primary" id="scf-save-btn">Save</button>
     </div>
@@ -1166,11 +1171,11 @@ function buildGlobalPanel({debug, playedThreshold, playlistPlayedRule}, {retenti
         ${selectHtml("scf-seen-retention", SEEN_RETENTION_LABELS, retention)}
       </div>
       <div class="scf-row">
-        <span class="scf-row-label">Count as played <span class="scf-nowrap">after <span class="scf-help" data-tip="How long a track has to play before it counts as played. Any play counts as soon as SoundCloud does, after about a second. Seeking doesn't count.">?</span></span></span>
+        <span class="scf-row-label">Track counts as played <span class="scf-nowrap">after <span class="scf-help" data-tip="How long a track has to play before it counts as played. Any play counts as soon as SoundCloud does, after about a second. Seeking doesn't count.">?</span></span></span>
         ${selectHtml("scf-played-threshold", PLAYED_THRESHOLD_LABELS, playedThreshold)}
       </div>
       <div class="scf-row">
-        <span class="scf-row-label">Playlist counts as played when <span class="scf-help" data-tip="On tabs that hide played tracks: hide a playlist once any of its tracks was played, or only once all of them were.">?</span></span>
+        <span class="scf-row-label">Playlists count as played <span class="scf-nowrap">after playing <span class="scf-help" data-tip="On tabs that hide played tracks: hide a playlist once any of its tracks was played, or only once all of them were.">?</span></span></span>
         ${selectHtml("scf-playlist-played-rule", PLAYLIST_PLAYED_RULE_LABELS, playlistPlayedRule)}
       </div>
       <div class="scf-group" id="scf-seen-data">
@@ -1194,13 +1199,17 @@ function buildGlobalPanel({debug, playedThreshold, playlistPlayedRule}, {retenti
         <span class="scf-row-label">Default tabs</span>
         <button class="scf-btn scf-btn-sm" id="scf-restore-btn">Restore</button>
       </div>
+      <div class="scf-global-links">
+        <button class="scf-help-btn" id="scf-tour-btn">Show welcome tour</button>
+        <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
+        <a class="scf-coffee-btn" href="${BUY_ME_A_COFFEE_URL}" target="_blank" rel="noopener noreferrer">
+          ${COFFEE_ICON_SVG}
+          <span>Buy me a coffee</span>
+        </a>
+      </div>
     </div>
-    <div class="scf-global-links">
-      <a class="scf-help-btn" href="${GITHUB_ISSUES_URL}" target="_blank" rel="noopener noreferrer">Help &amp; report an issue</a>
-      <a class="scf-coffee-btn" href="${BUY_ME_A_COFFEE_URL}" target="_blank" rel="noopener noreferrer">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M20.216 6.415l-.132-.666c-.119-.598-.388-1.163-1.001-1.379-.197-.069-.42-.098-.57-.241-.152-.143-.196-.366-.231-.572-.065-.378-.125-.756-.192-1.133-.057-.325-.102-.69-.25-.987-.195-.4-.597-.634-.996-.788a5.723 5.723 0 00-.626-.194c-1-.263-2.05-.36-3.077-.416a25.834 25.834 0 00-3.7.062c-.915.083-1.88.184-2.75.5-.318.116-.646.256-.888.501-.297.302-.393.77-.177 1.146.154.267.415.456.692.58.36.162.737.284 1.123.366 1.075.238 2.189.331 3.287.37 1.218.05 2.437.01 3.65-.118.299-.033.598-.073.896-.119.352-.054.578-.513.474-.834-.124-.383-.457-.531-.834-.473-.466.074-.96.108-1.382.146-1.177.08-2.358.082-3.536.006a22.228 22.228 0 01-1.157-.107c-.086-.01-.18-.025-.258-.036-.243-.036-.484-.08-.724-.13-.111-.027-.111-.185 0-.212h.005c.277-.06.557-.108.838-.147h.002c.131-.009.263-.032.394-.048a25.076 25.076 0 013.426-.12c.674.019 1.347.067 2.017.144l.228.031c.267.04.533.088.798.145.392.085.895.113 1.07.542.055.137.08.288.111.431l.319 1.484a.237.237 0 01-.199.284h-.003c-.037.006-.075.01-.112.015a36.704 36.704 0 01-4.743.295 37.059 37.059 0 01-4.699-.304c-.14-.017-.293-.042-.417-.06-.326-.048-.649-.108-.973-.161-.393-.065-.768-.032-1.123.161-.29.16-.527.404-.675.701-.154.316-.199.66-.267 1.001-.069.34-.176.707-.135 1.056.087.753.613 1.365 1.37 1.502a39.69 39.69 0 0011.343.376.483.483 0 01.535.53l-.071.697-1.018 9.907c-.041.41-.047.832-.125 1.237-.122.637-.553 1.028-1.182 1.171-.577.131-1.165.2-1.756.205-.656.004-1.31-.025-1.966-.022-.699.004-1.556-.06-2.095-.58-.475-.458-.54-1.174-.605-1.793l-.731-7.13-.322-3.152c-.037-.36-.351-.634-.708-.618-.339.014-.618.322-.579.694l.318 3.106.907 8.844c.083.808.83 1.6 1.664 1.789.905.204 1.803.238 2.719.243 1.19.007 2.401.007 3.567-.238.85-.178 1.696-.579 2.077-1.412.145-.318.244-.686.312-1.027.09-.457.14-.919.19-1.379l.24-2.2.522-4.789.19-1.751a.237.237 0 01.264-.209c.31.045.63.108.94.16.42.07.844.14 1.267.212 1.24.207 2.454.481 3.685.717.35.067.7.146 1.05.187a.237.237 0 01.208.263l-.174 1.61c-.041.376.207.7.579.72.339.017.626-.247.663-.585l.393-3.625c.017-.16.017-.322-.02-.48z"/></svg>
-        <span>Buy me a coffee</span>
-      </a>
+    <div class="scf-panel-footer">
+      <a class="scf-help-btn scf-rate-btn" href="${STORE_URL}" target="_blank" rel="noopener noreferrer">Rate the extension</a>
     </div>
   `;
     // textContent: tab names are user input.
@@ -1329,18 +1338,20 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
     });
 
     const countLines = el.querySelectorAll(".scf-seen-count");
-    const scopeEl = el.querySelector("#scf-as-scope");
+    const asToggle = el.querySelector("#scf-as-toggle");
+    const asSub = el.querySelector("#scf-as-sub");
     const infoEl = el.querySelector("#scf-as-info");
     // Runs after the segmented group's own handler has moved scf-active.
     function renderHistoryChoice() {
         const choice = readHistoryChoice();
-        scopeEl.hidden = choice.mode === "off";
-        infoEl.textContent = historySentence(choice);
+        asSub.classList.toggle("scf-visible", asToggle.checked);
+        infoEl.textContent = historySentence({mode: selectedHistoryMode(), source: choice.source});
         const activeScope = activeScopeOf(choice);
         for (const line of countLines) {
             line.classList.toggle("scf-seen-count-muted", line.dataset.source !== activeScope);
         }
     }
+    asToggle.addEventListener("change", renderHistoryChoice);
     for (const btn of el.querySelectorAll("#scf-as-mode .scf-seg-btn, #scf-as-source .scf-seg-btn")) {
         btn.addEventListener("click", renderHistoryChoice);
     }
@@ -1479,10 +1490,14 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
         renderChips();
     });
 
+    function selectedHistoryMode() {
+        return el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? "played";
+    }
+
     function readHistoryChoice() {
         const current = tab.type === "settings" ? tab.settings.alreadySeen : sanitizeSettings({}).alreadySeen;
         return {
-            mode: el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? current.mode,
+            mode: asToggle.checked ? selectedHistoryMode() : "off",
             paused: current.paused,
             source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? current.source,
         };
@@ -1522,8 +1537,9 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
     }
 }
 
-function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onPlayedThresholdChange, onPlaylistRuleChange, onClearAllSeen}) {
+function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onPlayedThresholdChange, onPlaylistRuleChange, onClearAllSeen, onShowTour}) {
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
+    el.querySelector("#scf-tour-btn").addEventListener("click", onShowTour);
     el.querySelector("#scf-restore-btn").addEventListener("click", onRestore);
     el.querySelector("#scf-debug-checkbox").addEventListener("change", (e) => {
         onDebugChange(e.target.checked).catch(console.error);
@@ -1605,6 +1621,8 @@ async function initFilters() {
     const {tabs, activeTabId, prefs, seenRetention, infoOpen} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
     applyConfig(activeTab, prefs, "update-only");
+    // On every page: a play recorded off the feed would otherwise pass for an existing user.
+    const cardStateLoaded = loadCardState();
 
     if (!window.location.href.includes("soundcloud.com/feed")) return;
 
@@ -1617,7 +1635,7 @@ async function initFilters() {
     // Load the active tab's seen lists early so the feed's first
     // scf:seen-query is answered without waiting on storage.
     warmSeenLists(activeTab);
-    setInfoTab(activeTab);
+    const countsLoaded = setInfoTab(activeTab);
 
     const header = await waitForElement(".stream__header");
     header.id = "scf-stream-header";
@@ -1632,6 +1650,7 @@ async function initFilters() {
             for (const li of tabBarEl.querySelectorAll("[data-tab-id]")) {
                 li.querySelector(".g-tabs-link").classList.toggle("active", li.dataset.tabId === id);
             }
+            renderCard();
         },
         onGearClick: async (id) => {
             const {tabs, seenRetention} = await loadState();
@@ -1716,6 +1735,10 @@ async function initFilters() {
                     const {tabs, activeTabId, prefs} = await loadState();
                     await saveAndResetFeed(tabs, activeTabId, prefs);
                 },
+                onShowTour: () => {
+                    document.getElementById("scf-global-panel")?.remove();
+                    replayTour();
+                },
                 onClose: () => {
                     document.getElementById("scf-global-panel")?.remove();
                 },
@@ -1757,6 +1780,10 @@ async function initFilters() {
 
     header.replaceChildren(tabBarEl);
     renderInfo();
+    // Put back the card replaceChildren just dropped, before the awaits below.
+    renderCard();
+    await Promise.all([countsLoaded, cardStateLoaded]);
+    renderCardAtLoad();
 }
 
 // SoundCloud saves {scrollTop} on unload and scrolls back to it on load (see initFilters).

@@ -96,6 +96,7 @@ body.theme-light {
   font-size: 16px;
   line-height: 1;
   padding-left: 6px;
+  padding-right: 6px;
 }
 #scf-tab-bar .scf-add-link:hover,
 #scf-tab-bar .scf-seen-toggle:hover { color: #ff5500; opacity: 1; }
@@ -190,7 +191,8 @@ body.theme-light {
 }
 .scf-close-btn:hover { color: var(--scf-text); }
 
-#scf-settings-panel .scf-body {
+#scf-settings-panel .scf-body,
+#scf-global-panel .scf-body {
   max-height: 60vh;
   overflow-y: auto;
 }
@@ -297,8 +299,6 @@ body.theme-light {
   align-items: center;
   gap: 8px;
 }
-.scf-inline-row > .scf-segmented { flex-shrink: 0; }
-.scf-inline-row[hidden] { display: none; }
 
 .scf-sub-section {
   display: none;
@@ -515,16 +515,19 @@ body.theme-light {
   padding: 10px 12px;
   border-top: 1px solid var(--scf-border);
 }
-.scf-panel-footer .scf-delete-btn {
-  margin-right: auto;
+.scf-text-btn {
   background: none;
   border: none;
+  padding: 0;
   color: var(--scf-text-muted);
   font-size: 12px;
-  cursor: pointer;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  text-decoration: none;
+  cursor: pointer;
 }
-.scf-panel-footer .scf-delete-btn:hover { color: #e04040; }
+.scf-text-btn:hover { color: var(--scf-text); }
+.scf-delete-btn { margin-right: auto; }
+.scf-delete-btn:hover { color: #e04040; }
 .scf-btn {
   padding: 5px 14px;
   font-size: 12px;
@@ -541,8 +544,55 @@ body.theme-light {
   border-color: #ff5500;
   color: #fff;
 }
-.scf-btn-primary:hover { background: #e04d00; }
+.scf-btn-primary:hover { background: #e04d00; color: #fff; }
 .scf-btn-sm { padding: 4px 10px; }
+
+/* Rating prompt and onboarding tour, under the tab bar */
+.scf-card {
+  position: relative;
+  min-width: 320px;
+  max-width: 360px;
+  margin: 0 0 10px -10px;
+  background: var(--scf-bg);
+  color: var(--scf-text);
+  border: 1px solid var(--scf-border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+}
+.scf-card > .scf-close-btn { position: absolute; top: 10px; right: 12px; }
+.scf-card .scf-card-text { margin: 0; padding: 12px; line-height: 1.45; white-space: pre-line; }
+#scf-rating-prompt .scf-card-text { padding-right: 32px; }
+.scf-card .scf-panel-footer > :first-child { margin-right: auto; }
+.scf-card .scf-card-step {
+  color: var(--scf-text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.scf-card .scf-btn-primary { text-decoration: none; }
+.scf-card .scf-coffee-btn {
+  width: auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  gap: 6px;
+}
+.scf-card .scf-coffee-btn svg { width: 14px; height: 14px; }
+
+#scf-tab-bar .scf-onboarding-target {
+  outline: 2px solid #ff5500;
+  outline-offset: 2px;
+  border-radius: 4px;
+  animation: scf-onboarding-pulse 1.6s ease-in-out infinite;
+}
+/* The pencil is otherwise only visible on hover. */
+#scf-tab-bar .scf-gear-btn.scf-onboarding-target { opacity: 1; color: var(--scf-text-2); }
+@keyframes scf-onboarding-pulse {
+  50% { outline-offset: 4px; outline-color: rgba(255,85,0,0.55); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #scf-tab-bar .scf-onboarding-target { animation: none; }
+}
 
 /* Global panel body */
 #scf-global-panel .scf-row .scf-seen-reset { font-size: 12px; }
@@ -569,8 +619,10 @@ body.theme-light {
   cursor: pointer;
 }
 #scf-global-panel .scf-help-btn:hover { background: var(--scf-bg-hover); color: var(--scf-text); }
+#scf-global-panel .scf-rate-btn { background: #ff5500; border-color: #ff5500; color: #fff; }
+#scf-global-panel .scf-rate-btn:hover { background: #e04d00; color: #fff; }
 /* Buy Me a Coffee brand banner */
-#scf-global-panel .scf-coffee-btn {
+.scf-coffee-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -588,5 +640,11 @@ body.theme-light {
   cursor: pointer;
   text-decoration: none;
 }
-#scf-global-panel .scf-coffee-btn:hover { background: #ffe74d; border-color: #ffe74d; }
-#scf-global-panel .scf-coffee-btn svg { display: block; }
+.scf-coffee-btn:hover { background: #ffe74d; border-color: #ffe74d; }
+.scf-coffee-btn svg { display: block; }
+
+/* SoundCloud styles a:link / a:visited / a:hover at (0,1,1). */
+a.scf-btn-primary:link, a.scf-btn-primary:visited { color: #fff; }
+a.scf-coffee-btn:link, a.scf-coffee-btn:visited, a.scf-coffee-btn:hover { color: #000000; text-decoration: none; }
+a.scf-text-btn:link, a.scf-text-btn:visited { color: var(--scf-text-muted); text-decoration: none; }
+a.scf-text-btn:hover { color: var(--scf-text); text-decoration: none; }
