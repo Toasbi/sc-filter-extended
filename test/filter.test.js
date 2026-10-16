@@ -171,7 +171,12 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder} = {}) {
         }
         await tick();
     }
-    return {sandbox, warnings, events, render, show, tick, XHR: FakeXHR};
+    // Pushes a config the way content.js does once it has read storage.
+    function applyConfig(cfg) {
+        document.documentElement.dataset.scfConfig = JSON.stringify(cfg);
+        document.dispatchEvent(new FakeCustomEvent("scf:apply-config", {detail: "update-only"}));
+    }
+    return {sandbox, warnings, events, render, show, tick, applyConfig, XHR: FakeXHR};
 }
 
 // Returns the parsed details of every recorded event of `type`.
@@ -223,6 +228,7 @@ function playlistRepost(ageDays) {
         type: "playlist-repost",
         created_at: daysAgo(ageDays),
         playlist: {
+            id: 700,
             created_at: daysAgo(ageDays),
             track_count: 2,
             user_id: 42,
@@ -318,8 +324,8 @@ async function seenOnHidesQueriedIds() {
     assert.strictEqual(queries[0].source, "tab");
     assert.deepStrictEqual(
         [...queries[0].ids].sort((a, b) => a - b),
-        [1, 2, 901, 902],
-        "query carries every track id, including tracks inside playlists"
+        [-700, 1, 2, 901, 902],
+        "query carries every track id, including tracks inside playlists, and the playlist's negated id"
     );
 }
 
@@ -370,7 +376,23 @@ async function seenSingleTrackPlaylistUsesPlaylistLink() {
     const bits = loadFilter({config: seenConfig("paused")});
     await runStream(bits, {collection: [single]});
     await bits.render("https://soundcloud.com/someone/sets/single?in=x", {visible: true});
-    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [901]}]);
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [-700, 901]}], "records the playlist and its one track");
+}
+
+async function seenPlaylistRecordsThePlaylistNotItsTracks() {
+    const ep = playlistRepost(1);
+    ep.playlist.permalink_url = "https://soundcloud.com/someone/sets/ep";
+    const bits = loadFilter({config: seenConfig("on"), seenResponder: () => []});
+    const out = await runStream(bits, {collection: [ep, track(901, 1)]});
+    assert.deepStrictEqual(ids(out), ["playlist", 901], "a track of a shown playlist still shows on its own");
+    await bits.render("/someone/sets/ep", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [-700]}]);
+}
+
+async function seenOnHidesSeenPlaylist() {
+    const bits = loadFilter({config: seenConfig("on"), seenResponder: () => [-700]});
+    const out = await runStream(bits, {collection: [playlistRepost(1), track(1, 1)]});
+    assert.deepStrictEqual(ids(out), [1], "a playlist recorded as seen is removed");
 }
 
 async function seenOnHidesRepeatOfTrackNotYetOnScreen() {
@@ -422,6 +444,25 @@ async function seenQueryTimeoutFallsBack() {
     assert.strictEqual(eventDetails(bits, "scf:seen-query").length, 1, "the query was sent");
 }
 
+async function responseWaitsForLateConfig() {
+    const bits = loadFilter({seenResponder: () => [2]});
+    const pending = runStream(bits, {collection: [track(1, 1), track(2, 1)]});
+    await bits.tick();
+    bits.applyConfig(seenConfig("on"));
+    const out = await pending;
+    assert.deepStrictEqual(ids(out), [1], "a response that beats the config is filtered once it lands");
+}
+
+async function responsePassesThroughWithoutConfig() {
+    const bits = loadFilter(); // content.js never sends a config
+    bits.sandbox.CONFIG_WAIT_MS = 30;
+    const out = await runStream(bits, {collection: [track(1, 1)]});
+    assert.deepStrictEqual(ids(out), [1], "response completes unfiltered after the timeout");
+    bits.sandbox.CONFIG_WAIT_MS = 60000;
+    const next = await runStream(bits, {collection: [track(2, 1)]});
+    assert.deepStrictEqual(ids(next), [2], "later responses don't wait again");
+}
+
 async function statsReportedAfterResponse() {
     const config = {
         id: "t1",
@@ -467,11 +508,15 @@ async function trackLengthMaxAtSliderEndHasNoUpperLimit() {
         seenPicksUpLinksRenderedBeforeResponse,
         seenIgnoresLinksOutsideTheFeed,
         seenSingleTrackPlaylistUsesPlaylistLink,
+        seenPlaylistRecordsThePlaylistNotItsTracks,
+        seenOnHidesSeenPlaylist,
         seenOnHidesRepeatOfTrackNotYetOnScreen,
         seenOffSendsNoQueryOrReport,
         seenPausedRecordsWithoutHiding,
         seenQueryCarriesSource,
         seenQueryTimeoutFallsBack,
+        responseWaitsForLateConfig,
+        responsePassesThroughWithoutConfig,
         statsReportedAfterResponse,
         trackLengthMaxAtSliderEndHasNoUpperLimit,
     ];

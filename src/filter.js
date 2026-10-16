@@ -106,14 +106,21 @@ function linkPath(link) {
     return link.pathname?.replace(/\/+$/, "") || null;
 }
 
-// Returns every track id in a stream response collection: the track of each
-// track / track-repost item plus the tracks inside playlists. This is what
-// filter.js asks content.js about in scf:seen-query.
+// Playlists share the seen lists with tracks; negating keeps their ids apart.
+function playlistSeenId(playlist) {
+    return playlist?.id != null ? -playlist.id : null;
+}
+
+// Returns every seen-list id in a stream response collection: the track of each
+// track / track-repost item, each playlist, and the tracks inside playlists.
+// This is what filter.js asks content.js about in scf:seen-query.
 function trackIdsIn(collection) {
     if (!Array.isArray(collection)) return [];
     const ids = new Set();
     for (const item of collection) {
         if (item?.track?.id != null) ids.add(item.track.id);
+        const playlistId = playlistSeenId(item?.playlist);
+        if (playlistId != null) ids.add(playlistId);
         const tracks = item?.playlist?.tracks;
         if (Array.isArray(tracks)) {
             for (const t of tracks) {
@@ -163,8 +170,8 @@ function shouldFilterTrack(track, settings, seenIds, debug) {
 }
 
 // Returns true if the playlist should be removed.
-// shown: {id, path, title} entries recorded as seen once on screen; a passing
-// single-track playlist pushes its track under the playlist's link.
+// shown: {ids, path, title} entries recorded as seen once on screen; a passing
+// playlist pushes its seen-list ids under the playlist's link.
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
 function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
     // hideAll is enforced server-side via the activityTypes rewrite, but
@@ -172,6 +179,11 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
     // — remove any playlist that reaches here.
     if (settings.playlistFilter.enabled && settings.playlistFilter.mode === "hideAll") {
         if (debug) debug.checks.push("playlistFilter ✗ hideAll");
+        return true;
+    }
+    const playlistId = playlistSeenId(playlist);
+    if (settings.alreadySeen?.mode === "on" && seenIds.has(playlistId)) {
+        if (debug) debug.checks.push("alreadySeen ✗ playlist filtered");
         return true;
     }
     const tracks = playlist.tracks;
@@ -220,18 +232,18 @@ function shouldFilterPlaylist(playlist, settings, seenIds, shown, debug) {
         if (debug) debug.checks.push(`nameInTitles ✓`);
     }
 
-    // Single-track playlists mark the track as seen (used to bump feed position).
-    if (tracks.length === 1) {
-        seenIds.add(tracks[0].id);
-        shown.push({id: tracks[0].id, path: permalinkPath(playlist.permalink_url), title: playlist.title});
-    }
+    // A single-track playlist stands for its track; longer ones only for themselves.
+    const seenAs = tracks.length === 1 ? [playlistId, tracks[0].id] : [playlistId];
+    const ids = seenAs.filter((id) => id != null);
+    for (const id of ids) seenIds.add(id);
+    shown.push({ids, path: permalinkPath(playlist.permalink_url), title: playlist.title});
     return false;
 }
 
 // Returns true if item should be removed from the feed.
 // seenIds (the per-response set) and shown (the entries recorded as seen once
 // on screen) are mutated in two places: here (when a track passes) and inside
-// shouldFilterPlaylist (single-track playlists mark the track seen directly).
+// shouldFilterPlaylist (a passing playlist marks itself seen directly).
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
 function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) {
     // Feed age filter (all types)
@@ -332,7 +344,7 @@ function shouldFilterItem(item, settings, followingData, seenIds, shown, debug) 
         const filtered = shouldFilterTrack(item.track, settings, seenIds, debug);
         if (!filtered) {
             seenIds.add(item.track.id);
-            shown.push({id: item.track.id, path: permalinkPath(item.track.permalink_url), title: item.track.title});
+            shown.push({ids: [item.track.id], path: permalinkPath(item.track.permalink_url), title: item.track.title});
         }
         return filtered;
     }
@@ -406,10 +418,11 @@ function getCookie(key) {
 // do this, we will end up removing the track altogether from
 // the stream, even though it's probably something the user
 // wanted to see.
-async function getFollowingUsers(debugEnabled) {
+// isDebug is read lazily: the fetch starts before content.js has sent a config.
+async function getFollowingUsers(isDebug) {
     let authToken = getCookie("oauth_token");
     if (authToken === null) {
-        if (debugEnabled) console.log("[SCF] Did not find OAuth token for current user");
+        if (isDebug?.()) console.log("[SCF] Did not find OAuth token for current user");
         return [];
     }
 
@@ -429,7 +442,7 @@ async function getFollowingUsers(debugEnabled) {
             url = resp.next_href;
         } while (url); // next_href may be null or absent on the last page
 
-        if (debugEnabled) console.log(`[SCF] Fetched ${followings.length} followings for current user`);
+        if (isDebug?.()) console.log(`[SCF] Fetched ${followings.length} followings for current user`);
         return followings;
     } catch (e) {
         console.warn("[SCF] failed to get following list:", e);
@@ -439,8 +452,8 @@ async function getFollowingUsers(debugEnabled) {
 
 // Returns the ids and usernames of the users that we're following
 // in the format {ids: Set<integer>, usernames: Array<string>}
-async function getFollowingIdsAndUsernames(debugEnabled) {
-    let users = await getFollowingUsers(debugEnabled);
+async function getFollowingIdsAndUsernames(isDebug) {
+    let users = await getFollowingUsers(isDebug);
     return {
         ids: new Set(users.map(u => u.id)),
         usernames: users.map(u => u.username),
@@ -614,6 +627,8 @@ async function softResetFeed() {
 // extension update), continue as if nothing was seen so the feed never hangs.
 // Top-level var so tests can shorten it through the vm sandbox.
 var SEEN_QUERY_TIMEOUT_MS = 3000;
+// Same for the first config: without it, responses pass through unfiltered.
+var CONFIG_WAIT_MS = 3000;
 let scfSeenReqId = 0;
 
 // Resolves the "Hide seen tracks" mode of a tab config. deepCuts tabs (and a
@@ -665,12 +680,12 @@ function reportSeen(tabId, ids) {
     let scfScanned = 0; // total items seen in this feed view
     // Shown tracks count as seen once their feed link is on screen, not when
     // their page loads. Both are cleared on every feed reset.
-    const scfUnseen = new Map(); // link path → {tabId, id, title}
+    const scfUnseen = new Map(); // link path → {tabId, ids, title}
     const scfShownInView = new Set(); // hides repeats of not-yet-seen tracks under "on"
     // Mutable: re-read from the dataset on every scf:apply-config event.
     let config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
     // Start fetching followings immediately — no await here is intentional.
-    const followings = getFollowingIdsAndUsernames(config?.debug);
+    const followings = getFollowingIdsAndUsernames(() => config?.debug);
 
     // Shows "Skipped X items out of Y" inside SoundCloud's infinite-scroll
     // spinner (div.loading) while it is visible, so a longer load reads as the
@@ -717,7 +732,7 @@ function reportSeen(tabId, ids) {
             if (!entry) continue;
             scfUnseen.delete(path);
             if (!byTab.has(entry.tabId)) byTab.set(entry.tabId, []);
-            byTab.get(entry.tabId).push(entry.id);
+            byTab.get(entry.tabId).push(...entry.ids);
             if (config?.debug) console.log(`[SCF] seen on screen "${entry.title}"`);
         }
         for (const [tabId, ids] of byTab) reportSeen(tabId, ids);
@@ -762,6 +777,26 @@ function reportSeen(tabId, ids) {
         scfFeedWatcher.disconnect();
     }
 
+    // filter.js starts before content.js has read storage, so the first
+    // feed response can arrive before any config does.
+    // After one timeout, later responses stop waiting.
+    let scfConfigWaitExpired = false;
+    function scfWhenConfigured() {
+        if (config || scfConfigWaitExpired) return Promise.resolve();
+        return new Promise((resolve) => {
+            const done = () => {
+                clearTimeout(timer);
+                document.removeEventListener("scf:apply-config", done);
+                resolve();
+            };
+            const timer = setTimeout(() => {
+                scfConfigWaitExpired = true;
+                done();
+            }, CONFIG_WAIT_MS);
+            document.addEventListener("scf:apply-config", done);
+        });
+    }
+
     // Capture the request URL in open() so it is available in send().
     // open() always precedes send() in the XHR lifecycle.
     const open = XMLHttpRequest.prototype.open;
@@ -785,7 +820,7 @@ function reportSeen(tabId, ids) {
             scfStreamSendCount++;
             scfInflightStreamXhrs.add(xhr);
             xhr.addEventListener("loadend", () => scfInflightStreamXhrs.delete(xhr));
-            xhr.onload = function (event) {
+            const filterOnload = function (event) {
                 // Always hand control back to SoundCloud's original onload, even if
                 // our filtering fails — otherwise SC's fetch never completes and the
                 // request hangs. finish() runs on the happy path, on any parse/filter
@@ -820,7 +855,7 @@ function reportSeen(tabId, ids) {
                             // filtering always satisfy the age cap, so the filtered
                             // collection could never trip it.
                             const rawCollection = responseData.collection;
-                            const shown = []; // {id, path, title} of tracks that passed every filter
+                            const shown = []; // {ids, path, title} of items that passed every filter
                             responseData.collection = rawCollection.filter((item) => {
                                 const label = item.track?.title ?? item.playlist?.title ?? item.type;
                                 if (cfg.type === "deepCuts") {
@@ -848,10 +883,10 @@ function reportSeen(tabId, ids) {
                             // On and Paused record what gets on screen; Off records nothing.
                             if (seenMode !== "off") {
                                 const unlinked = [];
-                                for (const {id, path, title} of shown) {
-                                    if (seenMode === "on") scfShownInView.add(id);
-                                    if (path) scfUnseen.set(path, {tabId: cfg.id, id, title});
-                                    else unlinked.push(id);
+                                for (const {ids, path, title} of shown) {
+                                    if (seenMode === "on") ids.forEach((id) => scfShownInView.add(id));
+                                    if (path) scfUnseen.set(path, {tabId: cfg.id, ids, title});
+                                    else unlinked.push(...ids);
                                 }
                                 if (unlinked.length > 0) reportSeen(cfg.id, unlinked);
                                 scfWatchFeed();
@@ -864,6 +899,11 @@ function reportSeen(tabId, ids) {
                     }
                     finish();
                 }, finish);
+            };
+            xhr.onload = function (event) {
+                scfWhenConfigured()
+                    .then(() => filterOnload.call(xhr, event))
+                    .catch(() => onload.call(xhr, event));
             };
         }
         send.call(this, data);

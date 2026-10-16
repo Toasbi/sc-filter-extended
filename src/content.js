@@ -744,27 +744,6 @@ document.addEventListener("scf:stats", (event) => {
     renderInfo();
 });
 
-// ── Impure: script injection ──────────────────────────────────────────────────
-
-// Injects filter.js into the page context and pushes the active config.
-// Safe to call multiple times per page load: the filter script guard prevents
-// double-injection, and repeated "update-only" config pushes are idempotent.
-function injectFilterScripts(tabConfig, debug) {
-    // IMPORTANT: applyConfig's dataset write must come before the filterScript
-    // append. filter.js reads document.documentElement.dataset.scfConfig once
-    // at IIFE load time (and re-reads it on every scf:apply-config event
-    // afterwards). The <script src> tag executes asynchronously (after
-    // fetch + parse), so the attribute is guaranteed to be set before
-    // filter.js first runs — but only if the applyConfig call comes first.
-    applyConfig(tabConfig, debug, "update-only");
-    if (!document.getElementById("scf-filter-script")) {
-        const filterScript = document.createElement("script");
-        filterScript.id = "scf-filter-script";
-        filterScript.src = browser.runtime.getURL("/src/filter.js");
-        document.documentElement.appendChild(filterScript);
-    }
-}
-
 // ── Pure: DOM builders ────────────────────────────────────────────────────────
 
 // ── Tooltip helpers ───────────────────────────────────────────────────────────
@@ -1500,11 +1479,13 @@ function waitForElement(selector) {
 let seenPruned = false;
 
 async function initFilters() {
-    // Always inject filter scripts (guarded internally against double-inject)
+    // A restored scroll offset lands below the spinner once seen tracks are hidden,
+    // so infinite scroll never fires. Firefox reads the mode when the reload starts.
+    history.scrollRestoration = window.location.href.includes("soundcloud.com/feed") ? "manual" : "auto";
 
     const {tabs, activeTabId, debug, seenRetention, infoOpen} = await loadState();
     const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
-    injectFilterScripts(activeTab, debug);
+    applyConfig(activeTab, debug, "update-only");
 
     if (!window.location.href.includes("soundcloud.com/feed")) return;
 
@@ -1650,6 +1631,11 @@ async function initFilters() {
 
     header.replaceChildren(tabBarEl);
     renderInfo();
+}
+
+// SoundCloud saves {scrollTop} on unload and scrolls back to it on load (see initFilters).
+if (window.location.href.includes("soundcloud.com/feed") && history.state?.scrollTop != null) {
+    history.replaceState(null, "");
 }
 
 waitForElement("#content").then((content) => {
