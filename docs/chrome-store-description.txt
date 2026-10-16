@@ -26,7 +26,7 @@ Note: You can always restore the default Filter Tabs by clicking the gear icon i
 - Track length — show only tracks within a duration range
 - Content age — control how old feed entries and uploads can be
 - Free downloads only — show only tracks with a free download link
-- Hide seen tracks — hide tracks you've already seen, even after a refresh or restart. Each tab remembers its own seen tracks or can use those of all tabs; pause or reset anytime, and choose how long they're kept (1 month to 1 year)
+- Hide seen/played tracks — hide tracks you've already seen or played, even after a refresh or restart. Each tab remembers its own seen tracks or can use those of all tabs; pause or reset anytime, and choose how long they're kept (1 month to 1 year)
 
 
 ➤  Default tabs
