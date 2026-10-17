@@ -459,16 +459,10 @@ body.theme-light {
   border: 2px solid var(--scf-bg);
   cursor: pointer;
 }
-.scf-warning {
-  display: none;
-  font-size: 11px;
-  color: #f5a623;
-  margin: 0;
-  line-height: 1.4;
-}
-.scf-warning:not([hidden]) { display: block; }
-
 /* Tag filter */
+.scf-tag-list { display: flex; flex-direction: column; gap: 6px; }
+.scf-tag-list-label { font-size: 11px; color: var(--scf-text-2); }
+.scf-tag-list-hint { color: var(--scf-text-muted); }
 .scf-tag-input-row { display: flex; gap: 4px; }
 .scf-tag-input {
   flex: 1;

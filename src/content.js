@@ -14,7 +14,7 @@ const DEFAULT_SETTINGS = {
     // paused: record without hiding. source: whose history to hide — "tab" (this tab's) | "all".
     alreadySeen: {mode: "played", paused: false, source: "all"},
     playlistFilter: {enabled: false, mode: "hideLarge", nameInTitles: false},
-    tagFilter: {enabled: false, mode: "include", tags: []},
+    tagFilter: {enabled: false, include: [], exclude: []},
 };
 
 const VALID_SEEN_MODES = new Set(["off", "played", "seen"]);
@@ -74,12 +74,19 @@ function deepMerge(defaults, stored) {
 // Note: typeof null === "object", so deepMerge's object-recursion branch is guarded
 // with `defaults[key] !== null` to handle null default leaf values (min/max of
 // contentAgeInDays). The Array.isArray guard is load-bearing — do not remove.
+function isObject(v) {
+    return v !== null && typeof v === "object";
+}
+
 function sanitizeSettings(stored) {
-    // Legacy "Hide seen tracks" was {enabled: boolean}, later {mode: "on" | "paused" | "off"}.
-    // Read it before deepMerge, which drops keys that aren't in DEFAULT_SETTINGS.
-    const legacySeen = stored !== null && typeof stored === "object" ? stored.alreadySeen : null;
+    // Legacy shapes are read before deepMerge, which drops keys that aren't in DEFAULT_SETTINGS.
+    // "Hide seen tracks" was {enabled: boolean}, later {mode: "on" | "paused" | "off"}.
+    // The tag filter was a single list: {mode: "include" | "exclude", tags}.
+    const raw = isObject(stored) ? stored : {};
+    const legacySeen = raw.alreadySeen;
+    const legacyTags = raw.tagFilter;
     const s = deepMerge(DEFAULT_SETTINGS, stored);
-    if (legacySeen !== null && typeof legacySeen === "object") {
+    if (isObject(legacySeen)) {
         if (!("mode" in legacySeen) && typeof legacySeen.enabled === "boolean") {
             s.alreadySeen.mode = legacySeen.enabled ? "seen" : "off";
         } else if (legacySeen.mode === "on" || legacySeen.mode === "paused") {
@@ -96,13 +103,30 @@ function sanitizeSettings(stored) {
     if (!VALID_FILTER_REPOSTS_TYPES.has(s.filterReposts.type)) {
         s.filterReposts.type = "allowNone";
     }
-    if (!Array.isArray(s.tagFilter.tags)) {
-        s.tagFilter.tags = [];
+    if (isObject(legacyTags) && Array.isArray(legacyTags.tags) &&
+        !("include" in legacyTags) && !("exclude" in legacyTags)) {
+        const list = legacyTags.mode === "exclude" ? "exclude" : "include";
+        s.tagFilter[list] = legacyTags.tags;
+        // An empty include list used to hide everything; now it restricts nothing.
+        if (list === "include" && legacyTags.tags.length === 0) s.tagFilter.enabled = false;
+    }
+    for (const list of ["include", "exclude"]) {
+        const tags = s.tagFilter[list];
+        s.tagFilter[list] = Array.isArray(tags) ? tags.filter((t) => typeof t === "string") : [];
     }
     if (!VALID_PLAYLIST_FILTER_MODES.has(s.playlistFilter.mode)) {
         s.playlistFilter.mode = "hideLarge";
     }
     return s;
+}
+
+// Adds the legacy {mode, tags} next to include/exclude, so an older install on another
+// synced device still filters sensibly instead of hiding its whole feed.
+function withLegacyTagFields(tab) {
+    if (tab.type !== "settings") return tab;
+    const {include, exclude} = tab.settings.tagFilter;
+    const legacy = include.length > 0 ? {mode: "include", tags: include} : {mode: "exclude", tags: exclude};
+    return {...tab, settings: {...tab.settings, tagFilter: {...tab.settings.tagFilter, ...legacy}}};
 }
 
 // ── Pure: content age UI ↔ storage conversion ─────────────────────────────
@@ -195,7 +219,7 @@ function buildDefaultTabs() {
             settings: sanitizeSettings({
                 trackLengthInMin: {enabled: true, min: 45, max: TRACK_LENGTH_MAX_MIN},
                 playlistFilter: {enabled: true, mode: "hideLarge", nameInTitles: true},
-                tagFilter: {enabled: true, mode: "include", tags: ["downtempo"]}
+                tagFilter: {enabled: true, include: ["downtempo"], exclude: []}
             }),
         },
         {
@@ -372,7 +396,7 @@ function defaultPrefs() {
 }
 
 async function save(tabs, activeTabId) {
-    await browser.storage.sync.set({scFilterTabs: tabs, scActiveTabId: activeTabId});
+    await browser.storage.sync.set({scFilterTabs: tabs.map(withLegacyTagFields), scActiveTabId: activeTabId});
 }
 
 // Writes the active tab config (plus the global prefs from loadState) to the
@@ -991,6 +1015,18 @@ function historyCountLine(scope, label, seen, played, activeScope) {
         </div>`;
 }
 
+function tagListHtml(list, label, hint) {
+    return `
+          <div class="scf-tag-list" data-list="${list}">
+            <span class="scf-tag-list-label">${label} <span class="scf-tag-list-hint">— ${hint}</span></span>
+            <div class="scf-tag-input-row">
+              <input type="text" class="scf-tag-input" placeholder="add tag…">
+              <button class="scf-btn scf-btn-sm scf-tag-add-btn">Add</button>
+            </div>
+            <div class="scf-tag-chips"></div>
+          </div>`;
+}
+
 function buildSettingsPanel(tab, {counts, retention}) {
     const s = tab.type === "settings" ? tab.settings : sanitizeSettings({});
     const historyOn = s.alreadySeen.mode !== "off";
@@ -1045,23 +1081,15 @@ function buildSettingsPanel(tab, {counts, retention}) {
 
       <div class="scf-group">
         <div class="scf-row">
-          <span class="scf-row-label">Tag filter <span class="scf-help" data-tip="Include mode: only show items matching your tags. Exclude mode: hide items with your tags.">?</span></span>
+          <span class="scf-row-label">Tag filter <span class="scf-help" data-tip="Include: only show items with one of these tags. Exclude: always hide items with any of these. Tags match whole, so &quot;house&quot; does not match &quot;deep house&quot;.">?</span></span>
           <label class="scf-toggle">
             <input type="checkbox" id="scf-tf-toggle"${s.tagFilter.enabled ? " checked" : ""}>
             <span class="scf-toggle-track"></span>
           </label>
         </div>
         <div id="scf-tag-section" class="scf-sub-section${s.tagFilter.enabled ? " scf-visible" : ""}">
-          <div class="scf-segmented">
-            <button id="scf-tf-include" class="scf-seg-btn${s.tagFilter.mode === "include" ? " scf-active" : ""}">Include</button>
-            <button id="scf-tf-exclude" class="scf-seg-btn${s.tagFilter.mode === "exclude" ? " scf-active" : ""}">Exclude</button>
-          </div>
-          <div class="scf-tag-input-row">
-            <input type="text" id="scf-tf-input" class="scf-tag-input" placeholder="add tag…">
-            <button id="scf-tf-add" class="scf-btn scf-btn-sm scf-tag-add-btn">Add</button>
-          </div>
-          <div id="scf-tag-chips" class="scf-tag-chips"></div>
-          <p class="scf-warning" id="scf-tf-warning"${!(s.tagFilter.enabled && s.tagFilter.mode === "include" && s.tagFilter.tags.length === 0) ? " hidden" : ""}>⚠ Include mode with no tags will hide everything</p>
+          ${tagListHtml("include", "Include", "only show items with one of these")}
+          ${tagListHtml("exclude", "Exclude", "always hide items with any of these")}
         </div>
       </div>
 
@@ -1297,6 +1325,8 @@ function dualSlider(el, prefix, maxFloor, renderLabel) {
 }
 
 function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistory}) {
+    const current = tab.type === "settings" ? tab.settings : sanitizeSettings({});
+
     // Close buttons
     el.querySelector(".scf-close-btn").addEventListener("click", onClose);
     el.querySelector("#scf-close-footer-btn").addEventListener("click", onClose);
@@ -1414,99 +1444,33 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
         caLabelEl.textContent = caLabel(uiToStorageMin(mn), uiToStorageMax(mx));
     });
 
-    // Tag filter toggle + mode + chips
     const tfToggle = el.querySelector("#scf-tf-toggle");
     const tagSection = el.querySelector("#scf-tag-section");
-    const tfInclude = el.querySelector("#scf-tf-include");
-    const tfExclude = el.querySelector("#scf-tf-exclude");
-    const tfInput = el.querySelector("#scf-tf-input");
-    const tfAdd = el.querySelector("#scf-tf-add");
-    const chipContainer = el.querySelector("#scf-tag-chips");
-    const tagWarning = el.querySelector("#scf-tf-warning");
-    const tfClear = document.createElement("button");
-    tfClear.className = "scf-seen-reset scf-tag-clear-btn";
-    tfClear.textContent = "Clear all";
-
-    // Local mutable copy of tags for this panel session
-    let localTags = [...(tab.type === "settings" ? tab.settings.tagFilter.tags : [])];
-    let localMode = tab.type === "settings" ? tab.settings.tagFilter.mode : "include";
-
-    function renderChips() {
-        chipContainer.innerHTML = "";
-        localTags.forEach((tag) => {
-            const chip = document.createElement("span");
-            chip.className = "scf-tag-chip";
-            chip.textContent = tag;
-            const rm = document.createElement("button");
-            rm.className = "scf-tag-chip-remove";
-            rm.textContent = "×";
-            rm.addEventListener("click", () => {
-                localTags = localTags.filter((t) => t !== tag);
-                renderChips();
-            });
-            chip.appendChild(rm);
-            chipContainer.appendChild(chip);
-        });
-        chipContainer.appendChild(tfClear);
-        chipContainer.hidden = localTags.length === 0;
-        tagWarning.hidden = !(
-            tfToggle.checked && localMode === "include" && localTags.length === 0
-        );
-    }
-
-    renderChips();
-
     tfToggle.addEventListener("change", () => {
         tagSection.classList.toggle("scf-visible", tfToggle.checked);
-        renderChips();
     });
 
-    tfInclude.addEventListener("click", () => {
-        localMode = "include";
-        renderChips();
-    });
-    tfExclude.addEventListener("click", () => {
-        localMode = "exclude";
-        renderChips();
-    });
-
-    function addTag() {
-        const tag = tfInput.value.trim().toLowerCase();
-        if (!tag || localTags.includes(tag)) {
-            tfInput.value = "";
-            return;
-        }
-        localTags.push(tag);
-        renderChips();
-        tfInput.value = "";
+    const tagLists = {};
+    for (const root of el.querySelectorAll(".scf-tag-list")) {
+        const list = root.dataset.list;
+        const other = list === "include" ? "exclude" : "include";
+        tagLists[list] = tagListEditor(root, current.tagFilter[list], (tag) => tagLists[other].remove(tag));
     }
-
-    tfAdd.addEventListener("click", addTag);
-    tfInput.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") addTag();
-    });
-    tfClear.addEventListener("click", () => {
-        localTags = [];
-        renderChips();
-    });
 
     function selectedHistoryMode() {
         return el.querySelector("#scf-as-mode .scf-seg-btn.scf-active")?.dataset.mode ?? "played";
     }
 
     function readHistoryChoice() {
-        const current = tab.type === "settings" ? tab.settings.alreadySeen : sanitizeSettings({}).alreadySeen;
         return {
             mode: asToggle.checked ? selectedHistoryMode() : "off",
-            paused: current.paused,
-            source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? current.source,
+            paused: current.alreadySeen.paused,
+            source: el.querySelector("#scf-as-source .scf-seg-btn.scf-active")?.dataset.source ?? current.alreadySeen.source,
         };
     }
 
     function readPanelState() {
-        const settings = tab.type === "settings"
-            ? JSON.parse(JSON.stringify(tab.settings))
-            : sanitizeSettings({});
+        const settings = JSON.parse(JSON.stringify(current));
 
         settings.filterReposts.enabled = el.querySelector("#scf-fr-toggle").checked;
         settings.filterReposts.type = el.querySelector("#scf-fr-type").value;
@@ -1526,8 +1490,8 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
         settings.playlistFilter.nameInTitles = el.querySelector("#scf-pf-nit-toggle").checked;
 
         settings.tagFilter.enabled = el.querySelector("#scf-tf-toggle").checked;
-        settings.tagFilter.mode = localMode;
-        settings.tagFilter.tags = [...localTags];
+        settings.tagFilter.include = tagLists.include.tags();
+        settings.tagFilter.exclude = tagLists.exclude.tags();
 
         return {
             ...tab,
@@ -1535,6 +1499,63 @@ function attachPanelListeners(el, tab, {onSave, onDelete, onClose, onResetHistor
             settings,
         };
     }
+}
+
+// Wires one tag list's input and chips. onAdd lets the other list drop the same tag.
+function tagListEditor(root, initialTags, onAdd) {
+    const input = root.querySelector(".scf-tag-input");
+    const chipContainer = root.querySelector(".scf-tag-chips");
+    const clear = document.createElement("button");
+    clear.className = "scf-seen-reset scf-tag-clear-btn";
+    clear.textContent = "Clear all";
+    let tags = [...initialTags];
+
+    function renderChips() {
+        chipContainer.innerHTML = "";
+        tags.forEach((tag) => {
+            const chip = document.createElement("span");
+            chip.className = "scf-tag-chip";
+            chip.textContent = tag;
+            const rm = document.createElement("button");
+            rm.className = "scf-tag-chip-remove";
+            rm.textContent = "×";
+            rm.addEventListener("click", () => {
+                tags = tags.filter((t) => t !== tag);
+                renderChips();
+            });
+            chip.appendChild(rm);
+            chipContainer.appendChild(chip);
+        });
+        chipContainer.appendChild(clear);
+        chipContainer.hidden = tags.length === 0;
+    }
+
+    function addTag() {
+        const tag = input.value.trim().toLowerCase();
+        input.value = "";
+        if (!tag || tags.includes(tag)) return;
+        tags.push(tag);
+        renderChips();
+        onAdd(tag);
+    }
+
+    root.querySelector(".scf-tag-add-btn").addEventListener("click", addTag);
+    input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") addTag();
+    });
+    clear.addEventListener("click", () => {
+        tags = [];
+        renderChips();
+    });
+    renderChips();
+    return {
+        tags: () => [...tags],
+        remove(tag) {
+            if (!tags.includes(tag)) return;
+            tags = tags.filter((t) => t !== tag);
+            renderChips();
+        },
+    };
 }
 
 function attachGlobalPanelListeners(el, {onRestore, onClose, onDebugChange, onRetentionChange, onPlayedThresholdChange, onPlaylistRuleChange, onClearAllSeen, onShowTour}) {

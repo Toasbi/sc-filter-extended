@@ -273,6 +273,18 @@ function shouldFilterPlaylist(playlist, settings, history, shown, debug) {
 // screen) are mutated in two places: here (when a track passes) and inside
 // shouldFilterPlaylist (a passing playlist marks itself seen directly).
 // debug: optional object; if provided, debug.checks is appended with each evaluated check result.
+// Keyed by the config's tagFilter object, which is replaced on every config push.
+const scfTagSets = new WeakMap();
+
+function tagSetsOf(tagFilter) {
+    let sets = scfTagSets.get(tagFilter);
+    if (!sets) {
+        sets = {include: new Set(tagFilter.include), exclude: new Set(tagFilter.exclude)};
+        scfTagSets.set(tagFilter, sets);
+    }
+    return sets;
+}
+
 function shouldFilterItem(item, settings, followingData, history, shown, debug) {
     // Feed age filter (all types)
     if (settings.contentAgeInDays.enabled && settings.contentAgeInDays.min !== null) {
@@ -288,21 +300,18 @@ function shouldFilterItem(item, settings, followingData, history, shown, debug) 
     if (settings.tagFilter.enabled) {
         const tagObj = item.track ?? item.playlist ?? null;
         if (tagObj != null) {
+            const {include, exclude} = tagSetsOf(settings.tagFilter);
             const itemTags = getItemTags(tagObj);
-            if (settings.tagFilter.mode === "include") {
-                if (itemTags.length === 0 || !itemTags.some((t) => settings.tagFilter.tags.includes(t))) {
-                    if (debug) debug.checks.push(`tagFilter ✗ no matching include tags (item: [${itemTags.join(", ")}])`);
-                    return true;
-                }
-                if (debug) debug.checks.push(`tagFilter ✓ matched include tag (item: [${itemTags.join(", ")}])`);
-            } else {
-                const blocked = itemTags.find((t) => settings.tagFilter.tags.includes(t));
-                if (blocked) {
-                    if (debug) debug.checks.push(`tagFilter ✗ blocked tag "${blocked}"`);
-                    return true;
-                }
-                if (debug) debug.checks.push(`tagFilter ✓ no blocked tags (item: [${itemTags.join(", ")}])`);
+            const blocked = itemTags.find((t) => exclude.has(t));
+            if (blocked) {
+                if (debug) debug.checks.push(`tagFilter ✗ excluded tag "${blocked}"`);
+                return true;
             }
+            if (include.size > 0 && !itemTags.some((t) => include.has(t))) {
+                if (debug) debug.checks.push(`tagFilter ✗ no included tag (item: [${itemTags.join(", ")}])`);
+                return true;
+            }
+            if (debug) debug.checks.push(`tagFilter ✓ (item: [${itemTags.join(", ")}])`);
         }
     }
 

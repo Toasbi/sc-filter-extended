@@ -28,7 +28,7 @@ function defaultSettings(overrides = {}) {
         freeDownloadsOnly: {enabled: false},
         alreadySeen: {mode: "off", paused: false, source: "tab"},
         playlistFilter: {enabled: false, mode: "hideLarge", nameInTitles: false},
-        tagFilter: {enabled: false, mode: "include", tags: []},
+        tagFilter: {enabled: false, include: [], exclude: []},
         ...overrides,
     };
 }
@@ -532,6 +532,31 @@ async function trackLengthMaxAtSliderEndHasNoUpperLimit() {
     assert.deepStrictEqual(ids(out), [2, 3], "a 120 max shown as \"120+ min\" keeps tracks longer than 120 min");
 }
 
+function tagConfig(include, exclude) {
+    return {type: "settings", settings: defaultSettings({tagFilter: {enabled: true, include, exclude}}), debug: false};
+}
+
+const tagged = (id, genre, tag_list = "") => track(id, 1, {genre, tag_list});
+
+async function tagIncludeAndExcludeCombine() {
+    const bits = loadFilter({config: tagConfig(["progressive"], ["house"])});
+    const out = await runStream(bits, {collection: [
+        tagged(1, "Progressive"),
+        tagged(2, "Progressive", "house"),
+        tagged(3, "Techno"),
+        tagged(4, "House", "progressive"),
+        tagged(5, "", '"progressive house"'),
+        tagged(6, ""),
+    ]});
+    assert.deepStrictEqual(ids(out), [1], "include must match, any exclude match hides, tags match whole");
+}
+
+async function tagExcludeOnlyKeepsUntagged() {
+    const bits = loadFilter({config: tagConfig([], ["house"])});
+    const out = await runStream(bits, {collection: [tagged(1, "Techno"), tagged(2, "House"), tagged(3, "")]});
+    assert.deepStrictEqual(ids(out), [1, 3], "an empty include list restricts nothing");
+}
+
 const PLAY_HISTORY_URL = "https://api-v2.soundcloud.com/me/play-history?client_id=abc";
 const playBody = (trackId, playlistId) => JSON.stringify(playlistId == null
     ? {track_urn: `soundcloud:tracks:${trackId}`}
@@ -808,6 +833,8 @@ async function pausedPlayedSendsNoQuery() {
         responsePassesThroughWithoutConfig,
         statsReportedAfterResponse,
         trackLengthMaxAtSliderEndHasNoUpperLimit,
+        tagIncludeAndExcludeCombine,
+        tagExcludeOnlyKeepsUntagged,
         parsePlayHistoryBodyReadsUrns,
         playHistoryPostRecordsPlayImmediately,
         playCarriesTabIdWhenOff,

@@ -45,7 +45,7 @@ Click the ⓘ icon at the end of the tab bar to show live stats next to it:
 
 - **Repost filter** — block all reposts, allow only from people you follow, or show only from people you don't follow
 - **Playlist filter** — hide large playlists (more than 5 tracks) or all playlists; optionally show only playlists where the artist's name appears in a track title
-- **Tag filter** — include or exclude tracks by genre/tag
+- **Tag filter** — include and exclude tracks by genre/tag, together or alone
 - **Track length** — show only tracks within a duration range
 - **Content age** — control how old feed entries and uploads can be
 - **Free downloads only** — show only tracks with a free download link
