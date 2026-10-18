@@ -425,11 +425,102 @@ async function saveAndResetFeed(tabs, activeTabId, prefs) {
     applyConfig(activeTab, prefs, "reset-feed");
 }
 
+// ── Pure: seen storage helpers ────────────────────────────────────────────────
+
+function seenBucketKey(listId, period) {
+    return `scfSeen:${listId}:${period}`;
+}
+
+function seenDay(date) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function seenCutoffDay(now, months) {
+    const y = now.getFullYear();
+    const m = now.getMonth() - months;
+    const last = new Date(y, m + 1, 0).getDate();
+    return seenDay(new Date(y, m, Math.min(now.getDate(), last)));
+}
+
+// A period is a day "YYYY-MM-DD" or a legacy month "YYYY-MM".
+function isSeenPeriod(s) {
+    return typeof s === "string" && /^\d{4}-\d{2}(-\d{2})?$/.test(s);
+}
+
+function seenPeriodExpired(period, cutoffDay) {
+    return period.length === 7 ? period < cutoffDay.slice(0, 7) : period < cutoffDay;
+}
+
+// Returns a plain {listId: {period: count}} object from untrusted stored data.
+function sanitizeSeenIndex(raw) {
+    const index = {};
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return index;
+    for (const [listId, periods] of Object.entries(raw)) {
+        if (periods === null || typeof periods !== "object" || Array.isArray(periods)) continue;
+        const clean = {};
+        for (const [period, count] of Object.entries(periods)) {
+            if (isSeenPeriod(period) && Number.isInteger(count) && count >= 0) clean[period] = count;
+        }
+        index[listId] = clean;
+    }
+    return index;
+}
+
+function seenListCount(index, listId) {
+    let total = 0;
+    for (const n of Object.values(index[listId] ?? {})) total += n;
+    return total;
+}
+
+// Day periods before currentMonth ("YYYY-MM"), grouped per list and month.
+function planSeenCompaction(index, currentMonth) {
+    const plan = [];
+    for (const [listId, periods] of Object.entries(index)) {
+        const byMonth = new Map();
+        for (const period of Object.keys(periods)) {
+            if (period.length !== 10 || period.slice(0, 7) >= currentMonth) continue;
+            const month = period.slice(0, 7);
+            if (!byMonth.has(month)) byMonth.set(month, []);
+            byMonth.get(month).push(period);
+        }
+        for (const [month, days] of byMonth) plan.push({listId, month, days: days.sort()});
+    }
+    return plan;
+}
+
+function seenPendingTotal(pending) {
+    let total = 0;
+    for (const set of pending.values()) total += set.size;
+    return total;
+}
+
+// Periods sort chronologically as strings; a legacy month sorts just before its days.
+function planSeenPrune(index, cutoffDay, maxBytes, bytesPerId) {
+    const buckets = [];
+    for (const [listId, periods] of Object.entries(index)) {
+        for (const [period, count] of Object.entries(periods)) buckets.push({listId, period, count});
+    }
+    buckets.sort((a, b) => (a.period < b.period ? -1 : a.period > b.period ? 1 : 0));
+    let bytes = 0;
+    for (const b of buckets) bytes += b.count * bytesPerId;
+    const dropped = [];
+    for (const b of buckets) {
+        if (!seenPeriodExpired(b.period, cutoffDay) && bytes <= maxBytes) continue;
+        dropped.push({listId: b.listId, period: b.period});
+        bytes -= b.count * bytesPerId;
+    }
+    return dropped;
+}
+
 // ── Impure: seen storage ──────────────────────────────────────────────────────
-// Lists ("tab:<id>", "all", "played:tab:<id>" or "played") are stored as month buckets scfSeen:<listId>:<YYYY-MM>, sized in scfSeenIndex.
+// Lists ("tab:<id>", "all", "played:tab:<id>", "played") are stored as day buckets scfSeen:<listId>:<YYYY-MM-DD>, sized in scfSeenIndex. Older month buckets (<YYYY-MM>) are still read and pruned, never written.
 
 const SEEN_INDEX_KEY = "scfSeenIndex";
-const SEEN_FLUSH_DELAY_MS = 2000;
+// Batches scrolling; short because the flush on pagehide reads before it writes and
+// rarely finishes before a reload tears the page down.
+const SEEN_FLUSH_DELAY_MS = 5000;
+const SEEN_FLUSH_MAX_PENDING = 200;
 // Stays under storage.local's 10 MB quota without needing unlimitedStorage.
 const SEEN_MAX_BYTES = 8 * 1024 * 1024;
 const SEEN_BYTES_PER_ID = 11;
@@ -442,7 +533,10 @@ const seenSets = new Map();
 const seenLoaded = new Map();
 // listId → Set<number> of ids recorded but not yet written to storage.
 let seenPending = new Map();
+let seenInFlight = new Map(); // the batch flushSeen is writing
 let seenFlushTimer = null;
+let seenFlushQueued = false;
+let seenIndexCache = null; // sanitized scfSeenIndex as last read or written by a queued op
 // Loads and flushes run one at a time, so a load never reads storage halfway
 // through a flush (which could drop ids that are neither pending nor stored).
 let seenQueue = Promise.resolve();
@@ -453,38 +547,15 @@ function enqueueSeenOp(fn) {
     return run;
 }
 
-function seenBucketKey(listId, month) {
-    return `scfSeen:${listId}:${month}`;
-}
-
-function seenMonth(monthsAgo = 0) {
-    const now = new Date();
-    const d = new Date(now.getFullYear(), now.getMonth() - monthsAgo, 1);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-}
-
-// Returns a plain {listId: {month: count}} object from untrusted stored data.
-function sanitizeSeenIndex(raw) {
-    const index = {};
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return index;
-    for (const [listId, months] of Object.entries(raw)) {
-        if (months === null || typeof months !== "object" || Array.isArray(months)) continue;
-        const clean = {};
-        for (const [month, count] of Object.entries(months)) {
-            if (/^\d{4}-\d{2}$/.test(month) && Number.isInteger(count) && count >= 0) clean[month] = count;
-        }
-        index[listId] = clean;
-    }
-    return index;
-}
-
 async function loadSeenSet(listId) {
     const set = new Set();
     try {
         const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
-        const months = Object.keys(sanitizeSeenIndex(stored[SEEN_INDEX_KEY])[listId] ?? {});
-        if (months.length > 0) {
-            const keys = months.map((m) => seenBucketKey(listId, m));
+        const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+        seenIndexCache = index;
+        const periods = Object.keys(index[listId] ?? {});
+        if (periods.length > 0) {
+            const keys = periods.map((p) => seenBucketKey(listId, p));
             const buckets = await browser.storage.local.get(keys);
             for (const key of keys) {
                 if (!Array.isArray(buckets[key])) continue;
@@ -495,13 +566,14 @@ async function loadSeenSet(listId) {
         console.error(`[SCF] failed to load seen list ${listId}:`, e);
     }
     // Ids recorded while the list was loading: keep them in memory, but drop
-    // the ones storage already has so they stay in their first-seen month.
+    // the ones storage already has so they stay in the bucket they were first stored in.
     const pending = seenPending.get(listId);
     if (pending) {
         for (const id of [...pending]) {
             if (set.has(id)) pending.delete(id);
             else set.add(id);
         }
+        if (pending.size === 0) seenPending.delete(listId);
     }
     seenLoaded.set(listId, set);
     return set;
@@ -538,9 +610,11 @@ function recordPlayed(tabId, ids) {
         lists.push(historyListId(tabId, "played", "tab"), historyListId(tabId, "seen", "tab"));
     }
     recordIds(lists, ids);
+    // Plays are rare and the user expects them hidden after a reload.
+    flushSeenNow();
 }
 
-// The in-memory Sets update immediately; storage is written by a debounced flush.
+// The in-memory Sets update immediately; storage is written in batches.
 function recordIds(listIds, ids) {
     let added = false;
     for (const listId of listIds) {
@@ -559,7 +633,8 @@ function recordIds(listIds, ids) {
         }
     }
     if (added) {
-        scheduleSeenFlush();
+        if (seenPendingTotal(seenPending) >= SEEN_FLUSH_MAX_PENDING) flushSeenNow();
+        else scheduleSeenFlush();
         scheduleInfoRefresh();
     }
 }
@@ -568,24 +643,27 @@ function scheduleSeenFlush() {
     if (seenFlushTimer !== null) return;
     seenFlushTimer = setTimeout(() => {
         seenFlushTimer = null;
-        enqueueSeenOp(flushSeen).catch(console.error);
+        flushSeenNow();
     }, SEEN_FLUSH_DELAY_MS);
 }
 
-// Writes pending ids into the current month's buckets and updates the index.
-// Read-merge-write, so two SoundCloud windows don't overwrite each other.
+// Writes pending ids into today's buckets; read-merge-write so two SoundCloud
+// windows don't overwrite each other. Dedup only covers today's bucket, so an
+// id another window stored on an earlier day can be stored again.
 async function flushSeen() {
+    seenFlushQueued = false;
     if (seenPending.size === 0) return;
     const batch = seenPending;
     seenPending = new Map();
-    const month = seenMonth();
+    seenInFlight = batch;
+    const day = seenDay(new Date());
     try {
-        const keys = [...batch.keys()].map((listId) => seenBucketKey(listId, month));
+        const keys = [...batch.keys()].map((listId) => seenBucketKey(listId, day));
         const stored = await browser.storage.local.get([SEEN_INDEX_KEY, ...keys]);
         const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
         const updates = {};
         for (const [listId, ids] of batch) {
-            const key = seenBucketKey(listId, month);
+            const key = seenBucketKey(listId, day);
             const bucket = Array.isArray(stored[key]) ? stored[key] : [];
             const inBucket = new Set(bucket);
             for (const id of ids) {
@@ -595,42 +673,47 @@ async function flushSeen() {
                 }
             }
             updates[key] = bucket;
-            index[listId] = {...(index[listId] ?? {}), [month]: bucket.length};
+            index[listId] = {...(index[listId] ?? {}), [day]: bucket.length};
         }
         updates[SEEN_INDEX_KEY] = index;
         await browser.storage.local.set(updates);
+        seenIndexCache = index;
     } catch (e) {
         console.error("[SCF] failed to save seen tracks:", e);
-        // Keep the ids for the next flush.
         for (const [listId, ids] of batch) {
             const pending = seenPending.get(listId) ?? new Set();
             for (const id of ids) pending.add(id);
             seenPending.set(listId, pending);
         }
+        scheduleSeenFlush();
+    } finally {
+        seenInFlight = new Map();
     }
 }
 
-// Flushes immediately (best effort) when the page goes away, so a refresh
-// right after scrolling doesn't lose the last debounce window.
+// Flushes now, best effort; also used when the page goes away.
 function flushSeenNow() {
     if (seenFlushTimer !== null) {
         clearTimeout(seenFlushTimer);
         seenFlushTimer = null;
     }
-    if (seenPending.size > 0) enqueueSeenOp(flushSeen).catch(console.error);
+    if (seenFlushQueued || seenPending.size === 0) return;
+    seenFlushQueued = true;
+    enqueueSeenOp(flushSeen).catch(console.error);
 }
 
-// Queued so an in-flight flush is either fully counted (index) or still pending.
-function seenCount(listId) {
+function seenIndexReady() {
+    if (seenIndexCache !== null) return Promise.resolve();
     return enqueueSeenOp(async () => {
+        if (seenIndexCache !== null) return;
         const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
-        const months = sanitizeSeenIndex(stored[SEEN_INDEX_KEY])[listId] ?? {};
-        const flushed = Object.values(months).reduce((sum, n) => sum + n, 0);
-        return flushed + (seenPending.get(listId)?.size ?? 0);
-    }).catch((e) => {
-        console.error(`[SCF] failed to count seen list ${listId}:`, e);
-        return 0;
-    });
+        seenIndexCache = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+    }).catch((e) => console.error("[SCF] failed to read seen index:", e));
+}
+
+// Counted from memory so scrolling never reads storage.
+function seenCount(listId) {
+    return seenListCount(seenIndexCache ?? {}, listId) + (seenPending.get(listId)?.size ?? 0) + (seenInFlight.get(listId)?.size ?? 0);
 }
 
 // Removes the given lists from storage and memory; null removes every list.
@@ -641,7 +724,7 @@ function clearSeen(listIds) {
         const targets = listIds ?? [...new Set([...Object.keys(index), ...seenSets.keys(), ...seenPending.keys()])];
         const keys = [];
         for (const listId of targets) {
-            for (const month of Object.keys(index[listId] ?? {})) keys.push(seenBucketKey(listId, month));
+            for (const period of Object.keys(index[listId] ?? {})) keys.push(seenBucketKey(listId, period));
             delete index[listId];
             seenSets.delete(listId);
             seenLoaded.delete(listId);
@@ -653,68 +736,92 @@ function clearSeen(listIds) {
             await browser.storage.local.remove(keys);
             await browser.storage.local.set({[SEEN_INDEX_KEY]: index});
         }
-    }).catch((e) => console.error("[SCF] failed to clear seen tracks:", e))
+        seenIndexCache = listIds === null ? {} : index;
+    }).catch((e) => {
+        seenIndexCache = null;
+        console.error("[SCF] failed to clear seen tracks:", e);
+    })
         .finally(() => { refreshInfoCounts(); });
 }
 
-// Keeps the current month plus the last `retentionMonths`, so a track stays
-// hidden for N to N+1 months. Then drops the oldest buckets of any list
-// until the estimated size fits SEEN_MAX_BYTES.
+// Folds day buckets of past months into one month bucket per list, bounding the index.
+// The month buckets are set before the day keys are removed, so an interruption leaves duplicates, never loss.
+async function compactSeen(index) {
+    const plan = planSeenCompaction(index, seenDay(new Date()).slice(0, 7));
+    if (plan.length === 0) return;
+    const keys = [];
+    for (const {listId, month, days} of plan) {
+        keys.push(seenBucketKey(listId, month), ...days.map((d) => seenBucketKey(listId, d)));
+    }
+    const stored = await browser.storage.local.get(keys);
+    const updates = {};
+    const dayKeys = [];
+    for (const {listId, month, days} of plan) {
+        const monthKey = seenBucketKey(listId, month);
+        const merged = new Set();
+        for (const key of [monthKey, ...days.map((d) => seenBucketKey(listId, d))]) {
+            if (Array.isArray(stored[key])) for (const id of stored[key]) merged.add(id);
+        }
+        updates[monthKey] = [...merged];
+        for (const d of days) {
+            delete index[listId][d];
+            dayKeys.push(seenBucketKey(listId, d));
+        }
+        index[listId][month] = merged.size;
+    }
+    updates[SEEN_INDEX_KEY] = index;
+    await browser.storage.local.set(updates);
+    await browser.storage.local.remove(dayKeys);
+    seenIndexCache = index;
+}
+
+// Drops buckets older than retentionMonths (a legacy month bucket once its whole
+// month is), then the oldest buckets of any list until the estimate fits SEEN_MAX_BYTES.
+// Compacts afterwards, so expired day buckets are gone before they would be merged.
 function pruneSeen(retentionMonths) {
     return enqueueSeenOp(async () => {
         const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
         const index = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
-        const oldestKept = seenMonth(retentionMonths);
-        const buckets = [];
-        for (const [listId, months] of Object.entries(index)) {
-            for (const [month, count] of Object.entries(months)) buckets.push({listId, month, count});
+        const dropped = planSeenPrune(index, seenCutoffDay(new Date(), retentionMonths), SEEN_MAX_BYTES, SEEN_BYTES_PER_ID);
+        if (dropped.length > 0) {
+            for (const {listId, period} of dropped) {
+                delete index[listId][period];
+                if (Object.keys(index[listId]).length === 0) delete index[listId];
+                // Reloaded on next use; pending ids are merged back in by loadSeenSet.
+                seenSets.delete(listId);
+                seenLoaded.delete(listId);
+            }
+            await browser.storage.local.remove(dropped.map((b) => seenBucketKey(b.listId, b.period)));
+            await browser.storage.local.set({[SEEN_INDEX_KEY]: index});
         }
-        buckets.sort((a, b) => a.month.localeCompare(b.month));
-        let bytes = buckets.reduce((sum, b) => sum + b.count * SEEN_BYTES_PER_ID, 0);
-        const dropped = buckets.filter((b) => {
-            if (b.month >= oldestKept && bytes <= SEEN_MAX_BYTES) return false;
-            bytes -= b.count * SEEN_BYTES_PER_ID;
-            return true;
-        });
-        if (dropped.length === 0) return;
-        for (const {listId, month} of dropped) {
-            delete index[listId][month];
-            if (Object.keys(index[listId]).length === 0) delete index[listId];
-            // Reloaded on next use; pending ids are merged back in by loadSeenSet.
-            seenSets.delete(listId);
-            seenLoaded.delete(listId);
-        }
-        await browser.storage.local.remove(dropped.map((b) => seenBucketKey(b.listId, b.month)));
-        await browser.storage.local.set({[SEEN_INDEX_KEY]: index});
-    }).catch((e) => console.error("[SCF] failed to prune seen tracks:", e))
+        seenIndexCache = index;
+        await compactSeen(index);
+    }).catch((e) => {
+        seenIndexCache = null;
+        console.error("[SCF] failed to prune seen tracks:", e);
+    })
         .finally(() => { refreshInfoCounts(); });
 }
 
-// Estimated from the index so no ids have to be loaded.
-function seenBytes() {
-    return enqueueSeenOp(async () => {
-        const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
-        let ids = 0;
-        for (const months of Object.values(sanitizeSeenIndex(stored[SEEN_INDEX_KEY]))) {
-            for (const count of Object.values(months)) ids += count;
-        }
-        for (const pending of seenPending.values()) ids += pending.size;
-        return ids * SEEN_BYTES_PER_ID;
-    }).catch((e) => {
-        console.error("[SCF] failed to measure seen tracks:", e);
-        return 0;
-    });
+// Estimated from the cached index so no ids have to be loaded.
+async function seenBytes() {
+    await seenIndexReady();
+    let ids = 0;
+    for (const listId of Object.keys(seenIndexCache ?? {})) ids += seenListCount(seenIndexCache, listId);
+    for (const pending of seenPending.values()) ids += pending.size;
+    for (const inFlight of seenInFlight.values()) ids += inFlight.size;
+    return ids * SEEN_BYTES_PER_ID;
 }
 
 // {tabSeen, tabPlayed, allSeen, allPlayed} for the tab with id `tabId`.
 async function historyCounts(tabId) {
-    const [tabSeen, tabPlayed, allSeen, allPlayed] = await Promise.all([
-        seenCount(historyListId(tabId, "seen", "tab")),
-        seenCount(historyListId(tabId, "played", "tab")),
-        seenCount("all"),
-        seenCount("played"),
-    ]);
-    return {tabSeen, tabPlayed, allSeen, allPlayed};
+    await seenIndexReady();
+    return {
+        tabSeen: seenCount(historyListId(tabId, "seen", "tab")),
+        tabPlayed: seenCount(historyListId(tabId, "played", "tab")),
+        allSeen: seenCount("all"),
+        allPlayed: seenCount("played"),
+    };
 }
 
 async function seenSummary(tabId) {
@@ -780,7 +887,15 @@ document.addEventListener("scf:played", (event) => {
 
 window.addEventListener("pagehide", flushSeenNow);
 document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushSeenNow();
+    if (document.visibilityState === "hidden") {
+        flushSeenNow();
+    } else if (document.visibilityState === "visible") {
+        // Another window may have written since the cache was filled.
+        enqueueSeenOp(async () => {
+            const stored = await browser.storage.local.get(SEEN_INDEX_KEY);
+            seenIndexCache = sanitizeSeenIndex(stored[SEEN_INDEX_KEY]);
+        }).catch((e) => console.error("[SCF] failed to read seen index:", e)).then(() => refreshInfoCounts());
+    }
 });
 
 // ── Impure: tab bar info section ──────────────────────────────────────────────

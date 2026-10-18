@@ -206,10 +206,9 @@ document.addEventListener("click", (event) => {
     if (event.target.closest(ONBOARDING_STEPS[tour.step].target)) advanceTour();
 }, true);
 
-// Answered or finished in another SoundCloud tab.
-browser.storage.onChanged.addListener((changes, area) => {
-    if (area === "sync" && changes.scfRatingDone?.newValue === true) ratingDone = true;
-    else if (area === "local" && changes.scfOnboardingDone?.newValue === true) tour = null;
-    else return;
+// Answered in another SoundCloud tab. Sync only: local holds the seen lists, which change constantly.
+browser.storage.sync.onChanged.addListener((changes) => {
+    if (changes.scfRatingDone?.newValue !== true) return;
+    ratingDone = true;
     renderCard();
 });

@@ -739,6 +739,8 @@ async function softResetFeed() {
 // extension update), continue as if nothing was seen so the feed never hangs.
 // Top-level var so tests can shorten it through the vm sandbox.
 var SEEN_QUERY_TIMEOUT_MS = 3000;
+// Bounds the memory and observed anchors of entries whose items never render.
+var UNSEEN_MAX_PATHS = 500;
 // Same for the first config: without it, responses pass through unfiltered.
 var CONFIG_WAIT_MS = 3000;
 let scfSeenReqId = 0;
@@ -809,6 +811,7 @@ function readPlayer() {
     // Shown tracks count as seen once their feed link is on screen, not when
     // their page loads. Both are cleared on every feed reset.
     const scfUnseen = new Map(); // link path → {tabId, ids, title}
+    const scfWatchedLinks = new Map(); // link path → Set of observed anchors
     const scfShownInView = new Set(); // hides repeats of not-yet-seen tracks under "seen"
     // Mutable: re-read from the dataset on every scf:apply-config event.
     let config = JSON.parse(document.documentElement.dataset.scfConfig || "null");
@@ -854,9 +857,10 @@ function readPlayer() {
         const byTab = new Map();
         for (const {target, isIntersecting} of entries) {
             if (!isIntersecting) continue;
-            scfOnScreen.unobserve(target);
             const path = linkPath(target);
             const entry = scfUnseen.get(path);
+            scfUnwatchPath(path);
+            scfOnScreen.unobserve(target);
             if (!entry) continue;
             scfUnseen.delete(path);
             if (!byTab.has(entry.tabId)) byTab.set(entry.tabId, []);
@@ -867,10 +871,18 @@ function readPlayer() {
         if (scfUnseen.size === 0) scfStopWatchingFeed();
     });
 
+    function scfUnwatchPath(path) {
+        const links = scfWatchedLinks.get(path);
+        if (!links) return;
+        for (const link of links) scfOnScreen.unobserve(link);
+        scfWatchedLinks.delete(path);
+    }
+
     // Links outside the feed (other pages, the player bar) prove nothing.
-    function scfFeedLinksIn(node) {
+    // `scope` is where the node sits; removed nodes are detached, so it is their old parent.
+    function scfFeedLinksIn(node, scope = node) {
         if (node?.nodeType !== 1) return [];
-        if (!node.closest(".stream__list")) return node.querySelectorAll(".stream__list a[href]");
+        if (!scope?.closest?.(".stream__list")) return node.querySelectorAll(".stream__list a[href]");
         const links = [...node.querySelectorAll("a[href]")];
         if (node.matches("a[href]")) links.push(node);
         return links;
@@ -878,7 +890,27 @@ function readPlayer() {
 
     function scfWatchLinks(links) {
         for (const link of links) {
-            if (scfUnseen.has(linkPath(link))) scfOnScreen.observe(link);
+            const path = linkPath(link);
+            if (!scfUnseen.has(path)) continue;
+            let watched = scfWatchedLinks.get(path);
+            if (!watched) {
+                watched = new Set();
+                scfWatchedLinks.set(path, watched);
+            }
+            if (watched.has(link)) continue;
+            watched.add(link);
+            scfOnScreen.observe(link);
+        }
+    }
+
+    // Detached anchors would stay observed (and retained) forever; their unseen entry stays in case the item renders again.
+    function scfForgetLinks(node, parent) {
+        for (const link of scfFeedLinksIn(node, parent)) {
+            const path = linkPath(link);
+            const watched = scfWatchedLinks.get(path);
+            if (!watched?.delete(link)) continue;
+            scfOnScreen.unobserve(link);
+            if (watched.size === 0) scfWatchedLinks.delete(path);
         }
     }
 
@@ -886,6 +918,7 @@ function readPlayer() {
     // scroll. Only reads the DOM, so it cannot re-trigger itself.
     const scfFeedWatcher = new MutationObserver((records) => {
         for (const record of records) {
+            if (scfWatchedLinks.size > 0) for (const node of record.removedNodes) scfForgetLinks(node, record.target);
             for (const node of record.addedNodes) scfWatchLinks(scfFeedLinksIn(node));
         }
     });
@@ -903,6 +936,8 @@ function readPlayer() {
     function scfStopWatchingFeed() {
         scfFeedWatched = false;
         scfFeedWatcher.disconnect();
+        scfOnScreen.disconnect();
+        scfWatchedLinks.clear();
     }
 
     // filter.js starts before content.js has read storage, so the first
@@ -1049,8 +1084,15 @@ function readPlayer() {
                                 const unlinked = [];
                                 for (const {ids, path, title} of shown) {
                                     if (hides === "seen") ids.forEach((id) => scfShownInView.add(id));
-                                    if (path) scfUnseen.set(path, {tabId: cfg.id, ids, title});
-                                    else unlinked.push(...ids);
+                                    if (path) {
+                                        scfUnseen.delete(path);
+                                        scfUnseen.set(path, {tabId: cfg.id, ids, title});
+                                    } else unlinked.push(...ids);
+                                }
+                                while (scfUnseen.size > UNSEEN_MAX_PATHS) {
+                                    const oldest = scfUnseen.keys().next().value;
+                                    scfUnseen.delete(oldest);
+                                    scfUnwatchPath(oldest);
                                 }
                                 if (unlinked.length > 0) reportSeen(cfg.id, unlinked);
                                 scfWatchFeed();
@@ -1092,7 +1134,6 @@ function readPlayer() {
         scfScanned = 0;
         scfUnseen.clear();
         scfShownInView.clear();
-        scfOnScreen.disconnect();
         scfStopWatchingFeed();
         scfUpdateSkipInfo();
         scfReportStats(config?.id);

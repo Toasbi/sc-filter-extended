@@ -52,7 +52,8 @@ class FakeCustomEvent {
 //
 // The feed is fake too: render(href) adds a link the way SoundCloud renders an
 // item (seen by the MutationObserver), show(href) scrolls it on screen (fires
-// the IntersectionObserver). Like the real one, it batches entries per tick.
+// the IntersectionObserver), remove(href) takes it out again. Like the real
+// one, it batches entries per tick.
 //
 // `player` ({href, position, duration, playing}, mutable) fakes SoundCloud's player bar;
 // without it the player selectors find nothing. setInterval and Date.now are fake:
@@ -189,7 +190,7 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder, player = 
             querySelectorAll: () => [],
         };
         links.push(link);
-        if (feedWatched) mutate([{addedNodes: [link]}]);
+        if (feedWatched) mutate([{addedNodes: [link], removedNodes: []}]);
         await tick();
     }
     async function show(href) {
@@ -198,6 +199,17 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder, player = 
             if (watched.has(link)) queueIntersection(link);
         }
         await tick();
+    }
+    async function remove(href) {
+        for (const link of links.filter((l) => l.href === href)) {
+            links.splice(links.indexOf(link), 1);
+            if (feedWatched) mutate([{target: feedList, addedNodes: [], removedNodes: [link]}]);
+        }
+        await tick();
+    }
+    // A removal of an arbitrary subtree from `target`, as the mutation observer reports it.
+    function removeNode(node, target) {
+        if (feedWatched) mutate([{target, addedNodes: [], removedNodes: [node]}]);
     }
     // Pushes a config the way content.js does once it has read storage.
     function applyConfig(cfg) {
@@ -208,7 +220,7 @@ function loadFilter({config = null, cookie = "", fetch, seenResponder, player = 
         clock += seconds * 1000;
         for (const fn of [...intervals.values()]) fn();
     }
-    return {sandbox, warnings, events, sent, render, show, tick, applyConfig, runIntervals, intervals, XHR: FakeXHR};
+    return {sandbox, warnings, events, sent, watched, links, render, show, remove, removeNode, isFeedWatched: () => feedWatched, tick, applyConfig, runIntervals, intervals, XHR: FakeXHR};
 }
 
 // Returns the parsed details of every recorded event of `type`.
@@ -809,6 +821,92 @@ async function pausedPlayedSendsNoQuery() {
     assert.strictEqual(eventDetails(bits, "scf:seen-query").length, 0);
 }
 
+async function seenUnobservesEveryLinkOfATrackOnceSeen() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1), track(2, 1)]});
+    await bits.render("/artist2/track-2");
+    await bits.render("/artist1/track-1");
+    await bits.render("/artist1/track-1?ref=art");
+    assert.strictEqual(bits.watched.size, 3);
+    await bits.show("/artist1/track-1");
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}]);
+    assert.strictEqual(bits.watched.size, 1, "only track 2's link is still observed");
+    assert.strictEqual(bits.isFeedWatched(), true);
+}
+
+async function seenForgetsLinksRemovedFromTheFeed() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1), track(2, 1)]});
+    await bits.render("/artist1/track-1");
+    assert.strictEqual(bits.watched.size, 1);
+    await bits.remove("/artist1/track-1");
+    assert.strictEqual(bits.watched.size, 0);
+    assert.strictEqual(eventDetails(bits, "scf:seen").length, 0);
+    await bits.render("/artist1/track-1", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}], "the entry survives the removal");
+}
+
+const OUTSIDE_FEED = {nodeType: 1, closest: () => null};
+
+async function seenIgnoresRemovalsOutsideTheFeed() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1)]});
+    await bits.render("/artist1/track-1");
+    const [link] = bits.links;
+    const queries = [];
+    const tooltip = {
+        nodeType: 1,
+        matches: () => false,
+        // would return the watched link if the removal were not scoped to the feed
+        querySelectorAll: (selector) => { queries.push(selector); return selector === "a[href]" ? [link] : []; },
+    };
+    bits.removeNode(tooltip, OUTSIDE_FEED);
+    assert.deepStrictEqual(queries, [".stream__list a[href]"]);
+    assert.strictEqual(bits.watched.size, 1, "the feed link is still observed");
+    await bits.render("/artist1/track-1", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}]);
+}
+
+async function seenForgetsLinksWhenTheWholeFeedIsRemoved() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1), track(2, 1)]});
+    await bits.render("/artist1/track-1");
+    await bits.render("/artist2/track-2");
+    assert.strictEqual(bits.watched.size, 2);
+    const feed = {
+        nodeType: 1,
+        matches: () => false,
+        querySelectorAll: (selector) => (selector === ".stream__list a[href]" ? bits.links : []),
+    };
+    bits.removeNode(feed, OUTSIDE_FEED);
+    assert.strictEqual(bits.watched.size, 0);
+}
+
+async function seenStopsObservingOnceEverythingIsSeen() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    await runStream(bits, {collection: [track(1, 1)]});
+    assert.strictEqual(bits.isFeedWatched(), true);
+    await bits.render("/artist1/track-1?ref=art");
+    await bits.render("/artist1/track-1", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}]);
+    assert.strictEqual(bits.watched.size, 0);
+    assert.strictEqual(bits.isFeedWatched(), false);
+    await runStream(bits, {collection: [track(2, 1)]});
+    assert.strictEqual(bits.isFeedWatched(), true);
+    await bits.render("/artist2/track-2", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [1]}, {tabId: "t1", ids: [2]}]);
+}
+
+async function seenCapsUnseenTracks() {
+    const bits = loadFilter({config: seenConfig("seen"), seenResponder: () => []});
+    bits.sandbox.UNSEEN_MAX_PATHS = 2;
+    await runStream(bits, {collection: [track(1, 1), track(2, 1), track(3, 1)]});
+    await bits.render("/artist1/track-1", {visible: true});
+    await bits.render("/artist2/track-2", {visible: true});
+    await bits.render("/artist3/track-3", {visible: true});
+    assert.deepStrictEqual(eventDetails(bits, "scf:seen"), [{tabId: "t1", ids: [2]}, {tabId: "t1", ids: [3]}], "track 1 was dropped as the oldest");
+}
+
 (async () => {
     const tests = [
         stopsPaginationWhenPageReachesAgeCap,
@@ -821,6 +919,12 @@ async function pausedPlayedSendsNoQuery() {
         seenRecordedOnlyOnceOnScreen,
         seenPicksUpLinksRenderedBeforeResponse,
         seenIgnoresLinksOutsideTheFeed,
+        seenUnobservesEveryLinkOfATrackOnceSeen,
+        seenForgetsLinksRemovedFromTheFeed,
+        seenIgnoresRemovalsOutsideTheFeed,
+        seenForgetsLinksWhenTheWholeFeedIsRemoved,
+        seenStopsObservingOnceEverythingIsSeen,
+        seenCapsUnseenTracks,
         seenSingleTrackPlaylistUsesPlaylistLink,
         seenPlaylistRecordsThePlaylistNotItsTracks,
         seenHidesSeenPlaylist,
