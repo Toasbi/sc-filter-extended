@@ -9,7 +9,7 @@
         "128": "icons/icon128.png"
     },
     "minimum_chrome_version": "111",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "content_scripts": [
         {
             "matches": ["*://*.soundcloud.com/*"],
